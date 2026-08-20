@@ -168,7 +168,7 @@ def parse_args():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument(
         "--backend",
-        choices=("e3nn", "fasteq", "fasteq_uniform1d"),
+        choices=("e3nn", "cueq", "fasteq", "fasteq_uniform1d"),
         default="e3nn",
     )
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
@@ -193,8 +193,10 @@ def main():
         default_dtype=args.dtype,
         compile_mode=None,
         enable_cueq=args.backend != "e3nn",
-        cueq_optimize_all=args.backend == "fasteq",
-        cueq_optimize_channelwise=args.backend == "fasteq_uniform1d",
+        cueq_optimize_all=args.backend != "e3nn",
+        cueq_optimize_channelwise=False,
+        cueq_use_fasteq=args.backend == "fasteq",
+        cueq_fasteq_uniform1d_only=args.backend == "fasteq_uniform1d",
         enable_oeq=False,
     )
     # MACECalculator freezes parameters for inference.  Re-enable them so the
