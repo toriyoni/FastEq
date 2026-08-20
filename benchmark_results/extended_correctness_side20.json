@@ -1,0 +1,56 @@
+{
+  "atol": 5e-05,
+  "box_side": 20,
+  "common_parameter_tensors_compared": 20,
+  "conv_tp_weight_gradients": [
+    "interactions.0.conv_tp_weights.layer0.weight",
+    "interactions.0.conv_tp_weights.layer1.weight",
+    "interactions.0.conv_tp_weights.layer2.weight",
+    "interactions.0.conv_tp_weights.layer3.weight",
+    "interactions.1.conv_tp_weights.layer0.weight",
+    "interactions.1.conv_tp_weights.layer1.weight",
+    "interactions.1.conv_tp_weights.layer2.weight",
+    "interactions.1.conv_tp_weights.layer3.weight"
+  ],
+  "dtype": "float32",
+  "fasteq_parameter_numel_with_grad": 694320,
+  "fasteq_parameter_tensors_with_grad": 22,
+  "num_atoms": 24000,
+  "num_edges": 983516,
+  "reference_backend": "e3nn",
+  "reference_parameter_numel_with_grad": 694320,
+  "reference_parameter_tensors_with_grad": 26,
+  "rtol": 0.0005,
+  "status": "pass",
+  "tensor_errors": {
+    "energy": {
+      "max_abs": 1.0,
+      "max_rel_to_reference_max": 6.005002647605667e-08
+    },
+    "forces": {
+      "max_abs": 5.8710575103759766e-06,
+      "max_rel_to_reference_max": 2.514594348192637e-06
+    },
+    "loss": {
+      "max_abs": 2.9802322387695312e-08,
+      "max_rel_to_reference_max": 1.4132091386299518e-07
+    }
+  },
+  "unmatched_fasteq_gradient_names": [
+    "products.0.symmetric_contractions.weight",
+    "products.1.symmetric_contractions.weight"
+  ],
+  "unmatched_reference_gradient_names": [
+    "products.0.symmetric_contractions.contractions.0.weights.0",
+    "products.0.symmetric_contractions.contractions.0.weights.1",
+    "products.0.symmetric_contractions.contractions.0.weights_max",
+    "products.1.symmetric_contractions.contractions.0.weights.0",
+    "products.1.symmetric_contractions.contractions.0.weights.1",
+    "products.1.symmetric_contractions.contractions.0.weights_max"
+  ],
+  "worst_gradient": "interactions.0.conv_tp_weights.layer0.weight",
+  "worst_gradient_error": {
+    "max_abs": 5.960464477539063e-08,
+    "max_rel_to_reference_max": 2.749078921107483e-07
+  }
+}

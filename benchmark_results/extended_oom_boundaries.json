@@ -1,0 +1,32 @@
+{
+  "device": "NVIDIA H100 80GB HBM3",
+  "e3nn": {
+    "first_failed_box_side": 24,
+    "first_failed_num_atoms": 41472,
+    "status": "measured_oom",
+    "failure_stage": "force computation during warmup",
+    "attempted_allocation_gib": 4.25,
+    "process_memory_in_use_gib": 78.95,
+    "device_free_mib": 232.5,
+    "largest_successful_box_side": 20,
+    "largest_successful_num_atoms": 24000,
+    "largest_successful_peak_memory_gib": 58.313
+  },
+  "fasteq_uniform1d": {
+    "first_failed_box_side": 32,
+    "first_failed_num_atoms": 98304,
+    "status": "measured_oom",
+    "failure_stage": "force computation during warmup",
+    "attempted_allocation_mib": 984.0,
+    "process_memory_in_use_gib": 79.01,
+    "device_free_mib": 178.5,
+    "largest_successful_box_side": 28,
+    "largest_successful_num_atoms": 65856,
+    "largest_successful_peak_memory_gib": 61.541
+  },
+  "larger_sizes": {
+    "box_sides": [36, 40, 42, 44],
+    "num_atoms": [139968, 192000, 222264, 255552],
+    "status": "not_repeated_after_monotonic_oom_boundary"
+  }
+}

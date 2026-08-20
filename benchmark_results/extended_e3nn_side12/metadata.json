@@ -1,0 +1,18 @@
+{
+  "backend": "e3nn",
+  "command": "FastEq/test/mace_training_bench.py --backend e3nn --model FastEq/benchmark_results/models/MACE-OFF23_small.model --dtype float32 --device cuda --box-sides 12 --warmup 20 --repeats 50 --output-dir FastEq/benchmark_results/extended_e3nn_side12",
+  "cuequivariance": "0.8.0",
+  "cuequivariance_ops_torch_cu12": "0.8.0",
+  "cuequivariance_torch": "0.8.0",
+  "fasteq_commit": "6ee6d267286c875f9db9156fe90a9509ed2e485b",
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "hostname": "gxn70",
+  "mace_commit": "1a3feb9d17eb41ef40739364d8ef3034da00acf3",
+  "model": "/public-data/zhouxibo/zxb/FastEq/benchmark_results/models/MACE-OFF23_small.model",
+  "model_sha256": "165cce4cfec5a34b9c64d4ebf95de15d71106bb584b7291c8470f0749977c46f",
+  "python": "3.10.20",
+  "timed_region": "training=True force forward + mean(force^2).backward; zero_grad excluded",
+  "torch": "2.11.0+cu128",
+  "torch_cuda": "12.8",
+  "trainable_parameters": 694320
+}

@@ -1,0 +1,56 @@
+{
+  "atol": 5e-05,
+  "box_side": 16,
+  "common_parameter_tensors_compared": 20,
+  "conv_tp_weight_gradients": [
+    "interactions.0.conv_tp_weights.layer0.weight",
+    "interactions.0.conv_tp_weights.layer1.weight",
+    "interactions.0.conv_tp_weights.layer2.weight",
+    "interactions.0.conv_tp_weights.layer3.weight",
+    "interactions.1.conv_tp_weights.layer0.weight",
+    "interactions.1.conv_tp_weights.layer1.weight",
+    "interactions.1.conv_tp_weights.layer2.weight",
+    "interactions.1.conv_tp_weights.layer3.weight"
+  ],
+  "dtype": "float32",
+  "fasteq_parameter_numel_with_grad": 694320,
+  "fasteq_parameter_tensors_with_grad": 22,
+  "num_atoms": 12288,
+  "num_edges": 503396,
+  "reference_backend": "e3nn",
+  "reference_parameter_numel_with_grad": 694320,
+  "reference_parameter_tensors_with_grad": 26,
+  "rtol": 0.0005,
+  "status": "pass",
+  "tensor_errors": {
+    "energy": {
+      "max_abs": 1.0,
+      "max_rel_to_reference_max": 1.1731183679952663e-07
+    },
+    "forces": {
+      "max_abs": 4.798173904418945e-06,
+      "max_rel_to_reference_max": 2.1763208077464694e-06
+    },
+    "loss": {
+      "max_abs": 2.9802322387695312e-08,
+      "max_rel_to_reference_max": 1.403681449374088e-07
+    }
+  },
+  "unmatched_fasteq_gradient_names": [
+    "products.0.symmetric_contractions.weight",
+    "products.1.symmetric_contractions.weight"
+  ],
+  "unmatched_reference_gradient_names": [
+    "products.0.symmetric_contractions.contractions.0.weights.0",
+    "products.0.symmetric_contractions.contractions.0.weights.1",
+    "products.0.symmetric_contractions.contractions.0.weights_max",
+    "products.1.symmetric_contractions.contractions.0.weights.0",
+    "products.1.symmetric_contractions.contractions.0.weights.1",
+    "products.1.symmetric_contractions.contractions.0.weights_max"
+  ],
+  "worst_gradient": "node_embedding.linear.weight",
+  "worst_gradient_error": {
+    "max_abs": 5.587935447692871e-08,
+    "max_rel_to_reference_max": 4.423785432014499e-07
+  }
+}
