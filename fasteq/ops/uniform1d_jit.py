@@ -2852,10 +2852,16 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         
 
-        w = w.view(-1, w_seg_num, w_irreps)
-        x = x.view(-1, x_seg_num, x_irreps) # [node_num, x_seg_num, u_dim]
+        # Keep the public inputs, rather than views created inside forward(), in
+        # the autograd context.  PyTorch executes a custom Function.forward()
+        # without recording the internal view operations.  Saving those views
+        # therefore loses the connection needed when backward() itself is
+        # differentiated for force-loss training.
+        w_input, x_input, y_input = w, x, y
+        w = w_input.view(-1, w_seg_num, w_irreps)
+        x = x_input.view(-1, x_seg_num, x_irreps) # [node_num, x_seg_num, u_dim]
 
-        y = y.view(-1, y_seg_num, y_irreps)
+        y = y_input.view(-1, y_seg_num, y_irreps)
 
         #print(f"fasteq fwd w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
 
@@ -2893,7 +2899,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         #end_time = time.perf_counter() * 1000.0
         #print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
 
-        ctx.save_for_backward(w, x, y)
+        ctx.save_for_backward(w_input, x_input, y_input)
         ctx.i_list = i_list
         ctx.j_list = j_list
         ctx.k_list = k_list
@@ -2917,7 +2923,13 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        w, x, y = ctx.saved_tensors
+        w_input, x_input, y_input = ctx.saved_tensors
+        # Recreate the internal layouts under backward's autograd recording so
+        # the nested double-backward Function remains connected to the public
+        # inputs.
+        w = w_input.view(-1, ctx.w_seg_num, ctx.w_irreps)
+        x = x_input.view(-1, ctx.x_seg_num, ctx.x_irreps)
+        y = y_input.view(-1, ctx.y_seg_num, ctx.y_irreps)
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
         gw3, gx3, gy3 = FastUniform1dBackwardFunction.apply(
@@ -2926,11 +2938,11 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             ctx.input_indices, ctx.output_indices,
             ctx.out_seg_num, ctx.u_dim,
             ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num,
-            ctx.mode, bool(w.requires_grad), bool(ctx.use_multiwarp_candidates),
+            ctx.mode, bool(w_input.requires_grad), bool(ctx.use_multiwarp_candidates),
         )
-        grad_w = gw3.view(-1, ctx.w_seg_num * ctx.w_irreps) if w.requires_grad else None
-        grad_x = gx3.view(-1, ctx.x_seg_num * ctx.x_irreps)
-        grad_y = gy3.view(-1, ctx.y_seg_num * ctx.y_irreps)
+        grad_w = gw3.view_as(w_input) if w_input.requires_grad else None
+        grad_x = gx3.view_as(x_input)
+        grad_y = gy3.view_as(y_input)
         return grad_w, grad_x, grad_y, None, None, None, None
 
 def fast_uniform1d_jit(
