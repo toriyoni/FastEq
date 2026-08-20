@@ -312,10 +312,6 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_out):
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-
-
         w, x, y = ctx.saved_tensors
 
         if not x.requires_grad:
@@ -361,11 +357,6 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
             grad_x = triton_fused_fctp_bwd(grad_out, w, ctx.vstar, p_for_k, i_for_k, val_for_k, I_total, cg_val, can_use_empty_grad_x,
                                                             BK=8, BW=32, BU=32, num_warps=4)
         
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
-
         return None, grad_x, None, None  # None for w, y, meta gradients
 
 def fast_fctp(w, x, y, meta):
