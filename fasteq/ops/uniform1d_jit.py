@@ -2370,14 +2370,14 @@ def _run_fwd(
     fused_scatter = 0 in output_indices
 
     if use_x_src:
-        src_idx = input_indices[1].to(torch.int32)
+        src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
     elif use_y_src:
-        src_idx = input_indices[2].to(torch.int32)
+        src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
     else:
         raise RuntimeError("Input_indices 1 and 2 all empty")
 
     if fused_scatter:
-        dst_idx = output_indices[0].to(torch.int32)
+        dst_idx = _as_int32_meta_tensor(output_indices[0]).contiguous()
     else:
         dst_idx = None
 
@@ -2453,9 +2453,9 @@ def _run_bwd(
     fused_scatter = 0 in output_indices
 
     if use_x_src:
-        src_idx = input_indices[1].to(torch.int32)
+        src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
     elif use_y_src:
-        src_idx = input_indices[2].to(torch.int32)
+        src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
     else:
         src_idx = None
         raise RuntimeError("Input_indices 1 and 2 all empty")
@@ -2463,7 +2463,7 @@ def _run_bwd(
     grad_out = grad_out.view(-1, out_seg_num, u_dim)
 
     if fused_scatter:
-        dst_idx = output_indices[0].to(torch.int32)
+        dst_idx = _as_int32_meta_tensor(output_indices[0]).contiguous()
     else:
         dst_idx = None
 
