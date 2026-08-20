@@ -10,6 +10,7 @@ host-to-device transfer, and gradient clearing are outside the timed region.
 import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -51,6 +52,13 @@ def git_rev(path):
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unavailable"
+
+
+def package_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
 
 
 def force_training_step(model, batch):
@@ -267,6 +275,11 @@ def main():
         "python": platform.python_version(),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
+        "cuequivariance": package_version("cuequivariance"),
+        "cuequivariance_torch": package_version("cuequivariance-torch"),
+        "cuequivariance_ops_torch_cu12": package_version(
+            "cuequivariance-ops-torch-cu12"
+        ),
         "gpu": torch.cuda.get_device_name(),
         "backend": args.backend,
         "model": str(args.model.resolve()),
