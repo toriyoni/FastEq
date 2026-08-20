@@ -69,7 +69,7 @@ def force_training_step(model, batch):
     return loss, output
 
 
-def benchmark_one(model, batch, warmup, repeats):
+def benchmark_one(model, batch, warmup, repeats, required_grad_name_fragment=None):
     model.train()
     for _ in range(warmup):
         model.zero_grad(set_to_none=True)
@@ -122,17 +122,30 @@ def benchmark_one(model, batch, warmup, repeats):
         del loss, forces, output
 
     parameter_grads = [
-        parameter.grad for parameter in model.parameters() if parameter.grad is not None
+        (name, parameter.grad)
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
     ]
     if not parameter_grads:
         raise RuntimeError("force-loss backward produced no model parameter gradients")
+    if required_grad_name_fragment is not None and not any(
+        required_grad_name_fragment in name for name, _ in parameter_grads
+    ):
+        raise RuntimeError(
+            "force-loss backward produced no gradient for parameters containing "
+            f"{required_grad_name_fragment!r}"
+        )
     finite = all(
         parameter.grad is None or torch.isfinite(parameter.grad).all().item()
         for parameter in model.parameters()
     )
     if not finite:
         raise RuntimeError("non-finite parameter gradient after force-loss backward")
-    return raw, torch.cuda.max_memory_allocated() / (1024**3)
+    grad_stats = {
+        "parameter_tensors_with_grad": len(parameter_grads),
+        "parameter_numel_with_grad": sum(grad.numel() for _, grad in parameter_grads),
+    }
+    return raw, torch.cuda.max_memory_allocated() / (1024**3), grad_stats
 
 
 def profile_one(model, batch, trace_path, backend):
@@ -153,7 +166,11 @@ def profile_one(model, batch, trace_path, backend):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--backend", choices=("e3nn", "fasteq"), default="e3nn")
+    parser.add_argument(
+        "--backend",
+        choices=("e3nn", "fasteq", "fasteq_uniform1d"),
+        default="e3nn",
+    )
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--box-sides", type=int, nargs="+", default=[4, 6, 8])
@@ -175,7 +192,9 @@ def main():
         device=args.device,
         default_dtype=args.dtype,
         compile_mode=None,
-        enable_cueq=args.backend == "fasteq",
+        enable_cueq=args.backend != "e3nn",
+        cueq_optimize_all=args.backend == "fasteq",
+        cueq_optimize_channelwise=args.backend == "fasteq_uniform1d",
         enable_oeq=False,
     )
     # MACECalculator freezes parameters for inference.  Re-enable them so the
@@ -190,7 +209,15 @@ def main():
     for side in args.box_sides:
         atoms = build_water_box(side, density_g_cm3=args.density, seed=1234 + side)
         model, batch, edges = prepare_model_input(atoms, calculator)
-        raw, peak_memory_gb = benchmark_one(model, batch, args.warmup, args.repeats)
+        raw, peak_memory_gb, grad_stats = benchmark_one(
+            model,
+            batch,
+            args.warmup,
+            args.repeats,
+            required_grad_name_fragment=(
+                "conv_tp_weights" if args.backend == "fasteq_uniform1d" else None
+            ),
+        )
         for row in raw:
             raw_rows.append({"n_side": side, "num_atoms": len(atoms), "num_edges": edges, **row})
         result = {
@@ -202,6 +229,7 @@ def main():
             "warmup": args.warmup,
             "repeats": args.repeats,
             "peak_memory_gb": peak_memory_gb,
+            **grad_stats,
         }
         for field in ("forward_cuda_ms", "backward_cuda_ms", "total_cuda_ms", "total_wall_ms"):
             result.update({f"{field}_{key}": value for key, value in stats([r[field] for r in raw]).items()})
