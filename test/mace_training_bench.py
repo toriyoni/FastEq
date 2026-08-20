@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark MACE force-loss training with the native e3nn backend.
+"""Benchmark MACE force-loss training with e3nn or FastEq.
 
 The timed step builds forces with ``training=True`` and differentiates a
 force-only loss through them.  Consequently the backward phase contains the
@@ -135,13 +135,13 @@ def benchmark_one(model, batch, warmup, repeats):
     return raw, torch.cuda.max_memory_allocated() / (1024**3)
 
 
-def profile_one(model, batch, trace_path):
+def profile_one(model, batch, trace_path, backend):
     model.zero_grad(set_to_none=True)
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
     with profile(
         activities=activities, record_shapes=True, profile_memory=True
     ) as prof:
-        with record_function("mace_e3nn_force_training_step"):
+        with record_function(f"mace_{backend}_force_training_step"):
             loss, output = force_training_step(model, batch)
             torch.cuda.synchronize()
     prof.export_chrome_trace(str(trace_path))
@@ -153,6 +153,7 @@ def profile_one(model, batch, trace_path):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--backend", choices=("e3nn", "fasteq"), default="e3nn")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--box-sides", type=int, nargs="+", default=[4, 6, 8])
@@ -174,7 +175,7 @@ def main():
         device=args.device,
         default_dtype=args.dtype,
         compile_mode=None,
-        enable_cueq=False,
+        enable_cueq=args.backend == "fasteq",
         enable_oeq=False,
     )
     # MACECalculator freezes parameters for inference.  Re-enable them so the
@@ -193,7 +194,7 @@ def main():
         for row in raw:
             raw_rows.append({"n_side": side, "num_atoms": len(atoms), "num_edges": edges, **row})
         result = {
-            "backend": "e3nn",
+            "backend": args.backend,
             "dtype": args.dtype,
             "n_side": side,
             "num_atoms": len(atoms),
@@ -206,14 +207,20 @@ def main():
             result.update({f"{field}_{key}": value for key, value in stats([r[field] for r in raw]).items()})
         summary_rows.append(result)
         print(
-            f"e3nn {args.dtype} atoms={len(atoms)} edges={edges} "
+            f"{args.backend} {args.dtype} atoms={len(atoms)} edges={edges} "
             f"forward={result['forward_cuda_ms_median_ms']:.3f} ms "
             f"backward={result['backward_cuda_ms_median_ms']:.3f} ms "
             f"total={result['total_cuda_ms_median_ms']:.3f} ms "
             f"peak={peak_memory_gb:.3f} GiB"
         )
         if args.profile:
-            profile_one(model, batch, args.output_dir / f"profile_e3nn_{args.dtype}_side{side}.json")
+            profile_one(
+                model,
+                batch,
+                args.output_dir
+                / f"profile_{args.backend}_{args.dtype}_side{side}.json",
+                args.backend,
+            )
         del batch, model, atoms
         torch.cuda.empty_cache()
 
@@ -231,6 +238,7 @@ def main():
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
+        "backend": args.backend,
         "model": str(args.model.resolve()),
         "model_sha256": sha256(args.model),
         "fasteq_commit": git_rev(repo_root),
