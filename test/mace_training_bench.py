@@ -121,6 +121,11 @@ def benchmark_one(model, batch, warmup, repeats):
         )
         del loss, forces, output
 
+    parameter_grads = [
+        parameter.grad for parameter in model.parameters() if parameter.grad is not None
+    ]
+    if not parameter_grads:
+        raise RuntimeError("force-loss backward produced no model parameter gradients")
     finite = all(
         parameter.grad is None or torch.isfinite(parameter.grad).all().item()
         for parameter in model.parameters()
@@ -172,6 +177,12 @@ def main():
         enable_cueq=False,
         enable_oeq=False,
     )
+    # MACECalculator freezes parameters for inference.  Re-enable them so the
+    # measured force-loss backward is a genuine model-training operation and
+    # includes mixed position/parameter second derivatives.
+    for model in calculator.models:
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
 
     summary_rows = []
     raw_rows = []
@@ -224,6 +235,12 @@ def main():
         "model_sha256": sha256(args.model),
         "fasteq_commit": git_rev(repo_root),
         "mace_commit": git_rev(repo_root / "3rdparty" / "mace"),
+        "trainable_parameters": sum(
+            parameter.numel()
+            for model in calculator.models
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
         "timed_region": "training=True force forward + mean(force^2).backward; zero_grad excluded",
     }
     (args.output_dir / "metadata.json").write_text(
