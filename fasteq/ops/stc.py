@@ -756,6 +756,58 @@ def _select_best_stc_double_bwd_module(
 # Differentiable STC backward / training double backward
 # -----------------------------------------------------------------------------
 
+def _stc_grad_x0_torch(
+    grad_out,
+    x1,
+    x0,
+    i0,
+    coeffs_tensor,
+    paths_tensor,
+    *,
+    pad_value: int,
+):
+    """Compute the STC first-backward weight gradient with autograd-visible ops.
+
+    The generated STC backward kernel computes only ``grad_x1``.  Returning
+    ``None`` for ``grad_x0`` is sufficient for inference-style input gradients,
+    but it cuts a real force-loss chain when ``grad_out`` itself depends on the
+    STC output.  Keep this reference reduction differentiable so a subsequent
+    higher-order backward can traverse that indirect path as well.
+    """
+    B = int(x1.size(0))
+    U = int(x1.size(2))
+    X0 = int(x0.size(1))
+    V = int(grad_out.numel() // (B * U))
+    grad_out_3d = grad_out.reshape(B, V, U)
+    i0_i64 = i0.to(device=x1.device, dtype=torch.int64).reshape(-1)
+
+    contributions = []
+    target_indices = []
+    for path_index in range(int(paths_tensor.size(0))):
+        path = paths_tensor[path_index]
+        valid = path[path != int(pad_value)]
+        path_length = int(valid.numel())
+        if path_length < 3:
+            raise RuntimeError(
+                f"STC path {path_index} has invalid length {path_length}"
+            )
+        x1_indices = valid[:-2].to(dtype=torch.int64)
+        x0_index = int(valid[-2])
+        output_index = int(valid[-1])
+
+        value = grad_out_3d[:, output_index, :] * coeffs_tensor[path_index]
+        for x1_index in x1_indices:
+            value = value * x1[:, int(x1_index), :]
+        contributions.append(value)
+        target_indices.append(i0_i64 * X0 + x0_index)
+
+    flat_values = torch.cat(contributions, dim=0)
+    flat_indices = torch.cat(target_indices, dim=0)
+    flat_grad_x0 = torch.zeros(
+        (int(x0.size(0)) * X0, U), dtype=x0.dtype, device=x0.device
+    ).index_add(0, flat_indices, flat_values)
+    return flat_grad_x0.reshape_as(x0)
+
 class FastSTCBackwardFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, grad_out, x1, x0, i0, coeffs_tensor, idx_lists_tensor,
@@ -857,11 +909,6 @@ class FastSTCBackwardFunction(torch.autograd.Function):
             )
 
         d_go = d_go_3d.reshape(ctx.grad_out_shape)
-        d_x1_reshaped = d_x1.reshape(d_x1.shape[0], -1)
-        d_x0_reshaped = d_x0.reshape(d_x0.shape[0], -1)
-        print(f"d_go shape:{d_go.shape}, data:{d_go.data}")
-        print(f"d_x1_reshaped shape:{d_x1_reshaped.shape}, data:{d_x1_reshaped.data}")
-        print(f"d_x0_reshaped shape:{d_x0_reshaped.shape}, data:{d_x0_reshaped.data}")
         return d_go, d_x1, d_x0, None, None, None, None, None, None
 
 
@@ -953,7 +1000,16 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             grad_out.contiguous(), x1, x0, i0, coeffs_tensor, idx_lists_tensor,
             int(ctx.num_out_segments), int(ctx.pad_value), bool(ctx.use_multiwarp_candidates),
         )
-        return grad_x1, None, None, None, None, None, None, None, None
+        grad_x0 = _stc_grad_x0_torch(
+            grad_out,
+            x1,
+            x0,
+            i0,
+            coeffs_tensor,
+            paths_tensor,
+            pad_value=int(ctx.pad_value),
+        )
+        return grad_x1, grad_x0, None, None, None, None, None, None, None
 
 
 def fast_stc_uniform1d_jit(

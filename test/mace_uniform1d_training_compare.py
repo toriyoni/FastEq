@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare a reference backend and FastEq-Uniform1D MACE training numerics."""
+"""Compare a reference backend and a selective FastEq MACE training backend."""
 
 import argparse
 import json
@@ -21,7 +21,9 @@ def make_calculator(model_path, backend, dtype):
         cueq_optimize_all=True,
         cueq_optimize_channelwise=False,
         cueq_use_fasteq=False,
-        cueq_fasteq_uniform1d_only=backend == "fasteq_uniform1d",
+        cueq_fasteq_uniform1d_only=backend
+        in ("fasteq_uniform1d", "fasteq_cwtp_stc"),
+        cueq_fasteq_stc=backend == "fasteq_cwtp_stc",
         enable_oeq=False,
     )
     for model in calculator.models:
@@ -81,8 +83,18 @@ def main():
     parser.add_argument(
         "--reference-backend", choices=("e3nn", "cueq"), default="cueq"
     )
+    parser.add_argument(
+        "--actual-backend",
+        choices=("fasteq_uniform1d", "fasteq_cwtp_stc"),
+        default="fasteq_uniform1d",
+    )
     parser.add_argument("--atol", type=float, default=5.0e-5)
     parser.add_argument("--rtol", type=float, default=5.0e-4)
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Write error statistics without enforcing the requested tolerances.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -90,7 +102,7 @@ def main():
     atoms = build_water_box(args.box_side, seed=1234 + args.box_side)
     calculators = {
         backend: make_calculator(args.model, backend, args.dtype)
-        for backend in (args.reference_backend, "fasteq_uniform1d")
+        for backend in (args.reference_backend, args.actual_backend)
     }
     runs = {}
     edges = None
@@ -103,7 +115,7 @@ def main():
         runs[backend] = run_force_loss(model, batch)
 
     reference = runs[args.reference_backend]
-    actual = runs["fasteq_uniform1d"]
+    actual = runs[args.actual_backend]
     reference_gradients = reference["gradients"]
     actual_gradients = actual["gradients"]
     missing_gradients = sorted(reference_gradients.keys() - actual_gradients.keys())
@@ -131,6 +143,13 @@ def main():
             f"{args.reference_backend}={sorted(reference_conv_gradients)}, "
             f"fasteq={sorted(actual_conv_gradients)}"
         )
+    actual_stc_gradients = sorted(
+        name
+        for name in actual_gradients
+        if "symmetric_contractions.weight" in name
+    )
+    if args.actual_backend == "fasteq_cwtp_stc" and not actual_stc_gradients:
+        raise RuntimeError("FastEq STC produced no symmetric-contraction weight gradient")
 
     tensor_stats = {
         name: error_stats(reference[name], actual[name])
@@ -151,25 +170,10 @@ def main():
         key=lambda name: gradient_stats[name]["max_abs"],
     )
 
-    torch.testing.assert_close(
-        actual["energy"], reference["energy"], atol=args.atol, rtol=args.rtol
-    )
-    torch.testing.assert_close(
-        actual["forces"], reference["forces"], atol=args.atol, rtol=args.rtol
-    )
-    for name in common_gradients:
-        reference_gradient, actual_gradient = gradient_pairs[name]
-        torch.testing.assert_close(
-            actual_gradient,
-            reference_gradient,
-            atol=args.atol,
-            rtol=args.rtol,
-            msg=lambda message, parameter_name=name: f"{parameter_name}: {message}",
-        )
-
     result = {
-        "status": "pass",
+        "status": "measured" if args.report_only else "pass",
         "reference_backend": args.reference_backend,
+        "actual_backend": args.actual_backend,
         "dtype": args.dtype,
         "box_side": args.box_side,
         "num_atoms": len(atoms),
@@ -191,10 +195,30 @@ def main():
         "worst_gradient": worst_gradient,
         "worst_gradient_error": gradient_stats[worst_gradient],
         "conv_tp_weight_gradients": sorted(reference_conv_gradients),
+        "fasteq_stc_weight_gradients": actual_stc_gradients,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True))
     print(json.dumps(result, indent=2, sort_keys=True))
+
+    if args.report_only:
+        return
+
+    torch.testing.assert_close(
+        actual["energy"], reference["energy"], atol=args.atol, rtol=args.rtol
+    )
+    torch.testing.assert_close(
+        actual["forces"], reference["forces"], atol=args.atol, rtol=args.rtol
+    )
+    for name in common_gradients:
+        reference_gradient, actual_gradient = gradient_pairs[name]
+        torch.testing.assert_close(
+            actual_gradient,
+            reference_gradient,
+            atol=args.atol,
+            rtol=args.rtol,
+            msg=lambda message, parameter_name=name: f"{parameter_name}: {message}",
+        )
 
 
 if __name__ == "__main__":

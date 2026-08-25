@@ -1,0 +1,51 @@
+{
+  "actual_backend": "fasteq_cwtp_stc",
+  "atol": 0.0001,
+  "box_side": 2,
+  "common_parameter_tensors_compared": 22,
+  "conv_tp_weight_gradients": [
+    "interactions.0.conv_tp_weights.layer0.weight",
+    "interactions.0.conv_tp_weights.layer1.weight",
+    "interactions.0.conv_tp_weights.layer2.weight",
+    "interactions.0.conv_tp_weights.layer3.weight",
+    "interactions.1.conv_tp_weights.layer0.weight",
+    "interactions.1.conv_tp_weights.layer1.weight",
+    "interactions.1.conv_tp_weights.layer2.weight",
+    "interactions.1.conv_tp_weights.layer3.weight"
+  ],
+  "dtype": "float32",
+  "fasteq_parameter_numel_with_grad": 3847696,
+  "fasteq_parameter_tensors_with_grad": 22,
+  "fasteq_stc_weight_gradients": [
+    "products.0.symmetric_contractions.weight",
+    "products.1.symmetric_contractions.weight"
+  ],
+  "num_atoms": 24,
+  "num_edges": 1972,
+  "reference_backend": "cueq",
+  "reference_parameter_numel_with_grad": 3847696,
+  "reference_parameter_tensors_with_grad": 22,
+  "rtol": 0.001,
+  "status": "pass",
+  "tensor_errors": {
+    "energy": {
+      "max_abs": 0.0,
+      "max_rel_to_reference_max": 0.0
+    },
+    "forces": {
+      "max_abs": 7.450580596923828e-07,
+      "max_rel_to_reference_max": 1.278166965416892e-06
+    },
+    "loss": {
+      "max_abs": 5.21540641784668e-08,
+      "max_rel_to_reference_max": 6.235815190748687e-07
+    }
+  },
+  "unmatched_fasteq_gradient_names": [],
+  "unmatched_reference_gradient_names": [],
+  "worst_gradient": "products.0.symmetric_contractions.weight",
+  "worst_gradient_error": {
+    "max_abs": 2.980232238769531e-07,
+    "max_rel_to_reference_max": 1.470148920205021e-06
+  }
+}

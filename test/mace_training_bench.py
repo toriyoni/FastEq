@@ -77,7 +77,7 @@ def force_training_step(model, batch):
     return loss, output
 
 
-def benchmark_one(model, batch, warmup, repeats, required_grad_name_fragment=None):
+def benchmark_one(model, batch, warmup, repeats, required_grad_name_fragments=()):
     model.train()
     for _ in range(warmup):
         model.zero_grad(set_to_none=True)
@@ -136,13 +136,12 @@ def benchmark_one(model, batch, warmup, repeats, required_grad_name_fragment=Non
     ]
     if not parameter_grads:
         raise RuntimeError("force-loss backward produced no model parameter gradients")
-    if required_grad_name_fragment is not None and not any(
-        required_grad_name_fragment in name for name, _ in parameter_grads
-    ):
-        raise RuntimeError(
-            "force-loss backward produced no gradient for parameters containing "
-            f"{required_grad_name_fragment!r}"
-        )
+    for fragment in required_grad_name_fragments:
+        if not any(fragment in name for name, _ in parameter_grads):
+            raise RuntimeError(
+                "force-loss backward produced no gradient for parameters containing "
+                f"{fragment!r}"
+            )
     finite = all(
         parameter.grad is None or torch.isfinite(parameter.grad).all().item()
         for parameter in model.parameters()
@@ -176,7 +175,13 @@ def parse_args():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument(
         "--backend",
-        choices=("e3nn", "cueq", "fasteq", "fasteq_uniform1d"),
+        choices=(
+            "e3nn",
+            "cueq",
+            "fasteq",
+            "fasteq_uniform1d",
+            "fasteq_cwtp_stc",
+        ),
         default="e3nn",
     )
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
@@ -204,7 +209,9 @@ def main():
         cueq_optimize_all=args.backend != "e3nn",
         cueq_optimize_channelwise=False,
         cueq_use_fasteq=args.backend == "fasteq",
-        cueq_fasteq_uniform1d_only=args.backend == "fasteq_uniform1d",
+        cueq_fasteq_uniform1d_only=args.backend
+        in ("fasteq_uniform1d", "fasteq_cwtp_stc"),
+        cueq_fasteq_stc=args.backend == "fasteq_cwtp_stc",
         enable_oeq=False,
     )
     # MACECalculator freezes parameters for inference.  Re-enable them so the
@@ -224,8 +231,10 @@ def main():
             batch,
             args.warmup,
             args.repeats,
-            required_grad_name_fragment=(
-                "conv_tp_weights" if args.backend == "fasteq_uniform1d" else None
+            required_grad_name_fragments=(
+                ("conv_tp_weights", "symmetric_contractions.weight")
+                if args.backend == "fasteq_cwtp_stc"
+                else (("conv_tp_weights",) if args.backend == "fasteq_uniform1d" else ())
             ),
         )
         for row in raw:
