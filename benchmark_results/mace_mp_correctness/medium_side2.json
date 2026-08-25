@@ -1,0 +1,59 @@
+{
+  "atol": 0.0001,
+  "box_side": 2,
+  "common_parameter_tensors_compared": 20,
+  "conv_tp_weight_gradients": [
+    "interactions.0.conv_tp_weights.layer0.weight",
+    "interactions.0.conv_tp_weights.layer1.weight",
+    "interactions.0.conv_tp_weights.layer2.weight",
+    "interactions.0.conv_tp_weights.layer3.weight",
+    "interactions.1.conv_tp_weights.layer0.weight",
+    "interactions.1.conv_tp_weights.layer1.weight",
+    "interactions.1.conv_tp_weights.layer2.weight",
+    "interactions.1.conv_tp_weights.layer3.weight"
+  ],
+  "dtype": "float32",
+  "fasteq_parameter_numel_with_grad": 4688656,
+  "fasteq_parameter_tensors_with_grad": 22,
+  "num_atoms": 24,
+  "num_edges": 1972,
+  "reference_backend": "e3nn",
+  "reference_parameter_numel_with_grad": 4688656,
+  "reference_parameter_tensors_with_grad": 29,
+  "rtol": 0.001,
+  "status": "pass",
+  "tensor_errors": {
+    "energy": {
+      "max_abs": 0.0,
+      "max_rel_to_reference_max": 0.0
+    },
+    "forces": {
+      "max_abs": 1.1324882507324219e-06,
+      "max_rel_to_reference_max": 1.8663002169819568e-06
+    },
+    "loss": {
+      "max_abs": 1.4901161193847656e-08,
+      "max_rel_to_reference_max": 1.7400572043805941e-07
+    }
+  },
+  "unmatched_fasteq_gradient_names": [
+    "products.0.symmetric_contractions.weight",
+    "products.1.symmetric_contractions.weight"
+  ],
+  "unmatched_reference_gradient_names": [
+    "products.0.symmetric_contractions.contractions.0.weights.0",
+    "products.0.symmetric_contractions.contractions.0.weights.1",
+    "products.0.symmetric_contractions.contractions.0.weights_max",
+    "products.0.symmetric_contractions.contractions.1.weights.0",
+    "products.0.symmetric_contractions.contractions.1.weights.1",
+    "products.0.symmetric_contractions.contractions.1.weights_max",
+    "products.1.symmetric_contractions.contractions.0.weights.0",
+    "products.1.symmetric_contractions.contractions.0.weights.1",
+    "products.1.symmetric_contractions.contractions.0.weights_max"
+  ],
+  "worst_gradient": "interactions.0.conv_tp_weights.layer2.weight",
+  "worst_gradient_error": {
+    "max_abs": 4.0978193283081055e-08,
+    "max_rel_to_reference_max": 7.387195840605803e-07
+  }
+}

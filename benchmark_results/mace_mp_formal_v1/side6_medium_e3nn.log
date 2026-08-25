@@ -1,0 +1,14 @@
+/public-data/zhouxibo/miniconda3/envs/fasteq_v0.3.0/lib/python3.10/site-packages/e3nn/o3/_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+/public-data/zhouxibo/zxb/FastEq/3rdparty/mace/mace/calculators/mace.py:209: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  torch.load(f=model_path, map_location=device)
+/public-data/zhouxibo/miniconda3/envs/fasteq_v0.3.0/lib/python3.10/site-packages/torch/jit/_serialization.py:176: DeprecationWarning: `torch.jit.load` is deprecated. Please switch to `torch.export`.
+  warnings.warn(
+/public-data/zhouxibo/miniconda3/envs/fasteq_v0.3.0/lib/python3.10/site-packages/torch/jit/_serialization.py:176: DeprecationWarning: `torch.jit.load` is deprecated. Please switch to `torch.export`.
+  warnings.warn(
+/public-data/zhouxibo/miniconda3/envs/fasteq_v0.3.0/lib/python3.10/site-packages/torch/jit/_serialization.py:176: DeprecationWarning: `torch.jit.load` is deprecated. Please switch to `torch.export`.
+  warnings.warn(
+WARNING:root:Default dtype float32 does not match model dtype float64, converting models to float32.
+[Debug] torch.ops.load_library from['/public-data/zhouxibo/miniconda3/envs/fasteq_v0.3.0/lib/python3.10/site-packages/fasteq/cuda/_cuda.so', '/public-data/zhouxibo/miniconda3/envs/fasteq_v0.3.0/lib/python3.10/site-packages/fasteq/cuda/_cuda.cpython-310-x86_64-linux-gnu.so']
+[Debug] torch.ops.load_library from/public-data/zhouxibo/miniconda3/envs/fasteq_v0.3.0/lib/python3.10/site-packages/fasteq/cuda/_cuda.so
+e3nn float32 atoms=648 edges=54814 forward=39.811 ms backward=77.657 ms total=117.478 ms peak=7.136 GiB
