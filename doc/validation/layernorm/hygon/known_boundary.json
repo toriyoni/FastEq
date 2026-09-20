@@ -1,0 +1,189 @@
+{
+  "host": "f11r1n01",
+  "device": "BW",
+  "torch": "2.7.1",
+  "triton": "3.1.0",
+  "source_sha256": "41e00b377cbacef4713d88697c06e419f3b8c208d9fcc55be78b53fd5a23c2c6",
+  "implementation_sha256": "c1b2f19f8287ed352ab5a0579469eb797a0ef8b83276b923eaf3d1408b7e0d8b",
+  "shape": [
+    131072,
+    49,
+    128
+  ],
+  "seed": 20260914,
+  "atol": 5e-05,
+  "rtol": 0.0005,
+  "repetitions": [
+    {
+      "repeat": 0,
+      "checks": {
+        "forward": {
+          "numel": 822083584,
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.011544667241129307,
+          "failures": 0
+        },
+        "dX": {
+          "numel": 822083584,
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.0053080962663817205,
+          "failures": 0
+        },
+        "affine_weight": {
+          "numel": 896,
+          "max_abs": 0.0009765625,
+          "max_tolerance_ratio": 1.354132813346333,
+          "failures": 1
+        },
+        "affine_bias": {
+          "numel": 128,
+          "max_abs": 0.0,
+          "max_tolerance_ratio": 0.0,
+          "failures": 0
+        }
+      },
+      "bad": {
+        "affine_weight": [
+          {
+            "index": [
+              2,
+              125
+            ],
+            "actual": 0.125518798828125,
+            "reference": 0.1253662109375,
+            "abs_error": 0.000152587890625,
+            "tolerance": 0.00011268310546875,
+            "tolerance_ratio": 1.354132813346333
+          }
+        ],
+        "affine_bias": []
+      },
+      "change_from_previous": {}
+    },
+    {
+      "repeat": 1,
+      "checks": {
+        "forward": {
+          "numel": 822083584,
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.011544667241129307,
+          "failures": 0
+        },
+        "dX": {
+          "numel": 822083584,
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.0053080962663817205,
+          "failures": 0
+        },
+        "affine_weight": {
+          "numel": 896,
+          "max_abs": 0.0009765625,
+          "max_tolerance_ratio": 1.354132813346333,
+          "failures": 1
+        },
+        "affine_bias": {
+          "numel": 128,
+          "max_abs": 0.0,
+          "max_tolerance_ratio": 0.0,
+          "failures": 0
+        }
+      },
+      "bad": {
+        "affine_weight": [
+          {
+            "index": [
+              2,
+              125
+            ],
+            "actual": 0.125518798828125,
+            "reference": 0.1253662109375,
+            "abs_error": 0.000152587890625,
+            "tolerance": 0.00011268310546875,
+            "tolerance_ratio": 1.354132813346333
+          }
+        ],
+        "affine_bias": []
+      },
+      "change_from_previous": {
+        "fused": {
+          "max_abs": 0.0,
+          "different": 0
+        },
+        "torch": {
+          "max_abs": 0.0003662109375,
+          "different": 347
+        }
+      }
+    },
+    {
+      "repeat": 2,
+      "checks": {
+        "forward": {
+          "numel": 822083584,
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.011544667241129307,
+          "failures": 0
+        },
+        "dX": {
+          "numel": 822083584,
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.0053080962663817205,
+          "failures": 0
+        },
+        "affine_weight": {
+          "numel": 896,
+          "max_abs": 0.0009765625,
+          "max_tolerance_ratio": 1.354132813346333,
+          "failures": 1
+        },
+        "affine_bias": {
+          "numel": 128,
+          "max_abs": 0.0,
+          "max_tolerance_ratio": 0.0,
+          "failures": 0
+        }
+      },
+      "bad": {
+        "affine_weight": [
+          {
+            "index": [
+              2,
+              125
+            ],
+            "actual": 0.125518798828125,
+            "reference": 0.1253662109375,
+            "abs_error": 0.000152587890625,
+            "tolerance": 0.00011268310546875,
+            "tolerance_ratio": 1.354132813346333
+          }
+        ],
+        "affine_bias": []
+      },
+      "change_from_previous": {
+        "fused": {
+          "max_abs": 0.0,
+          "different": 0
+        },
+        "torch": {
+          "max_abs": 0.00048828125,
+          "different": 292
+        }
+      }
+    }
+  ],
+  "statistics": {
+    "moments": {
+      "numel": 131072,
+      "max_abs": 4.76837158203125e-07,
+      "max_tolerance_ratio": 0.0008579259781037129,
+      "failures": 0
+    },
+    "rstd": {
+      "numel": 131072,
+      "max_abs": 2.384185791015625e-07,
+      "max_tolerance_ratio": 0.0004380856410991271,
+      "failures": 0
+    },
+    "rstd_differing_atoms": 53312
+  }
+}

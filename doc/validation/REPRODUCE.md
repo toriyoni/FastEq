@@ -53,14 +53,15 @@ python -m pytest -q test/test_triton_attention_alpha.py \
 python -m pytest -q test/test_triton_equivariant_layer_norm.py \
   test/test_triton_equivariant_layer_norm_backward.py \
   test/test_triton_equivariant_layer_norm_precision.py \
+  test/test_triton_equivariant_merge_layer_norm.py \
   --junitxml="$run_dir/layernorm.xml"
 python test/stress_triton_attention_alpha.py --out "$run_dir/alpha_stress.json"
 ```
 
 Expected retained suite counts are GraphSoftmax CSR 215, GraphSoftmax raw index
 105, AttentionAlpha 67, and
-LayerNorm 218 per device, plus 13 AttentionAlpha stress cases. Individual-suite
-passes do not override the separately documented Separable scaling failure.
+LayerNorm 372 per device, plus 13 AttentionAlpha stress cases. Individual-suite
+passes do not override the separately documented Merge large-shape failure.
 The retained Alpha evidence has 66 existing tests and one separately executed
 padded-grid test per device; the command above runs all 67 together.
 Saved historical failure tensors in `test/data/graph_softmax` are regression
@@ -125,39 +126,80 @@ timing. Five warmups and 20 rotated samples record both synchronized wall and
 GPU-event milliseconds. The raw-index documentation reports wall medians;
 the earlier reusable-CSR tables report GPU-event medians.
 
-## Gate, Dropout and LayerNorm scaling
+## MergeLayerNorm benchmarks
+
+Run each shape/mode in a fresh process. This is the recorded bounded matrix,
+not a search for OOM; the Hygon Lmax=6, N=131072 backward comparison is expected
+to fail before timing. The loop keeps the exit code and log for each case.
+
+```bash
+for lmax in 3 6; do
+  for mode in fwd fwd_bwd; do
+    for n in 256 512 1024 2048 4096 8192 16384 32768 65536 131072; do
+      name="merge_l${lmax}_${mode}_${n}"
+      status=0
+      python test/benchmark_triton_equivariant_layer_norm.py \
+        --operators merge --mode "$mode" --lmax "$lmax" --channels 128 \
+        --nodes "$n" --warmup 5 --samples 20 \
+        --output "$run_dir/${name}.json" > "$run_dir/${name}.log" 2>&1 || status=$?
+      printf '%s\n' "$status" > "$run_dir/${name}.exit"
+    done
+  done
+done
+```
+
+The captured-model replay requires the recorded activation fixtures; those
+binary tensors and the pretrained checkpoint are not bundled in this source
+repository. Each fixture directory (`cu108` and `mixed280`) contains
+`blocks_0_norm_1.pt`, `blocks_0_norm_2.pt` and `norm.pt`. Each file is a
+weights-only-loadable dictionary with `name`, `input`, `output`, `state_dict`
+and constructor `kwargs`. Capture the inputs, outputs and parameters from the
+same original FP32 EQv3 layers in eval mode, preserving tensor strides.
+The fixture root also requires `provenance.json`, including
+`layernorm_sha256`; the retained replay JSON gives the measured checkpoint,
+reference, capture environment and exact fixture hashes. Newly captured
+fixtures constitute a new run unless these hashes match.
+
+```bash
+python test/benchmark_triton_merge_layer_norm_replay.py \
+  --fixtures /path/to/inference_fixtures --warmup 5 --samples 20 \
+  --out "$run_dir/merge_replay.json"
+```
+
+Both harnesses compare every output and requested first-order gradient against
+native Torch, alternate provider order, and retain GPU-event and synchronized
+wall samples. Replay compares both current implementations with saved outputs
+as well. No end-to-end model speedup is inferred from these layer measurements.
+
+## Gate and Dropout scaling
 
 ```bash
 export FASTEQ_VALIDATION_OUTPUT_DIR="$run_dir/scaling"
-python test/eqv3_validation/run.py --gpu 0 --smoke --ops gate dropout norm separable
-python test/eqv3_validation/run.py --gpu 0 --ops gate dropout norm separable
+python test/eqv3_validation/run.py --gpu 0 --smoke --ops gate dropout
+python test/eqv3_validation/run.py --gpu 0 --ops gate dropout
 ```
 
 The harness preserves the measured reference arithmetic and sampling method;
 its repository/output paths are portable, and the CLI is restricted to these
-four sweep keys. It starts at N=256 and doubles, in separate processes per
+four sweep keys (`norm` and `separable` remain available for new runs, but have
+no retained current-source performance sweep). It starts at N=256 and doubles,
+in separate processes per
 implementation/mode/shape, until allocation failure, an indexing precheck or
 runtime failure. Accuracy compares every output and requested gradient.
 Only reuse an output directory to resume that same run: existing point files,
 including failures, are not rerun. Never use `doc/validation` as the output.
 
-For a precise accuracy reproduction at the known Hygon boundary:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python test/eqv3_validation/run.py --worker \
-  --task check --op separable --n 262144 --mode fwd_bwd --backend fused \
-  --output "$run_dir/separable_262144.json"
-```
-
 ## Inspect retained evidence without a GPU
 
 [manifest.json](manifest.json) lists current source/test hashes, record groups,
-and checksums of every retained artifact. Each compressed sweep archive has
+and checksums of every retained artifact. Each Gate/Dropout compressed sweep archive has
 `points` and `checks` dictionaries keyed by the original JSON basename. CSV
 `check_file` values refer to entries in that archive. Arrays of per-iteration
 GPU/wall times, full-tensor error metrics, peak allocated memory and stopping
 errors remain available. Other operators and mismatched-source records have
-been filtered out; the retained entries themselves are unchanged.
+been filtered out; the retained entries themselves are unchanged. Merge matrix
+archives instead map original basenames directly to their result JSON; see
+[layernorm.md](../layernorm.md#records-and-reproduction).
 
 ```bash
 python test/check_eqv3_validation_records.py
@@ -165,5 +207,5 @@ python test/check_eqv3_validation_records.py
 
 This checks source/artifact hashes, suite counts, current GraphSoftmax and
 AttentionAlpha pass metrics, and retained sweep status counts. It does not run
-GPU kernels or claim a fresh GPU validation. The unresolved current-source
-Separable failure is expected evidence and is checked rather than suppressed.
+GPU kernels or claim a fresh GPU validation. The known Hygon Merge gradient
+failure is expected evidence and is checked rather than suppressed.

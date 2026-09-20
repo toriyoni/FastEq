@@ -62,6 +62,8 @@ class EquivariantNormSpec:
             sources = [(l,) for l in range(lmax + 1)]
         elif grouping == 'scalar_high':
             sources = [(0,)] + ([tuple(range(1, lmax + 1))] if lmax else [])
+        elif grouping == 'all':
+            sources = [tuple(range(lmax + 1))]
         else:
             raise ValueError('unknown grouping preset')
         if weighting not in ('component', 'degree_balanced', 'norm'):
@@ -649,6 +651,8 @@ def from_reference(source, *, device=None, accumulation="fp64", parameter_reduct
         # V3 separable actually reduces channels before weighted components.
         if name == 'EquivariantSeparableLayerNorm':
             order = 'channels_first'
+    elif name == 'EquivariantMergeLayerNorm':
+        grouping, order, center = 'all', 'channels_first', source.centering
     else:
         raise NotImplementedError(f'no verified source adapter for {name}')
     weighting = ('degree_balanced' if source.normalization == 'component'
@@ -658,14 +662,15 @@ def from_reference(source, *, device=None, accumulation="fp64", parameter_reduct
     if weighting == 'degree_balanced':
         weights = [list(row) for row in spec.stats_weights]
         cached = source.balance_degree_weight.detach().reshape(-1).cpu()
-        for l in range(1, source.lmax+1):
-            weights[spec.output_group[l]][l] = float(cached[l*l-1])
+        for l in range(0 if grouping == 'all' else 1, source.lmax+1):
+            offset = l*l if grouping == 'all' else l*l-1
+            weights[spec.output_group[l]][l] = float(cached[offset])
         spec = EquivariantNormSpec(spec.lmax, spec.channels, tuple(map(tuple, weights)),
                                    spec.output_group, spec.center_scalar, spec.eps)
     if device is None:
         tensors = list(source.parameters()) + list(source.buffers())
         device = tensors[0].device if tensors else torch.device('cuda')
-    parameter_order = ('expanded' if name == 'EquivariantSeparableLayerNorm'
+    parameter_order = ('expanded' if name in ('EquivariantMergeLayerNorm', 'EquivariantSeparableLayerNorm')
                        else 'broadcast')
     op = TritonEquivariantNorm(spec, reduction_order=order, device=device,
                               parameter_order=parameter_order, accumulation=accumulation)

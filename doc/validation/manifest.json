@@ -1,11 +1,11 @@
 {
   "scope": "Latest available results matching the production operator source hashes in this checkout",
-  "production_base_commit": "1f9b4a3c5b61d5320c924459afa10e34e25e064b",
+  "production_base_commit": "0def953693b894c04c59b7c3cc08c53240f2ebdc",
   "runtime_sha256": {
     "fasteq/triton/graph_softmax.py": "df6315ecd5e179ee52e62a8b0da10401b04ed85bda1ef6be44c7034a87d280c8",
     "fasteq/triton/graph_edge_layout.py": "d159a14695f5612e00975e27cdd09c14b6141ba1acb5ce80a7d312349f02a2f5",
     "fasteq/triton/fused_attention_alpha.py": "a1fb1f31b9d07166b71171b9fa52da8d290a93bbad1585830f27d8fd4817593a",
-    "fasteq/triton/fused_equivariant_layer_norm.py": "35d689624e48422801cfdb0b8461243f7a88ee012dc20122206433098a90da5d",
+    "fasteq/triton/fused_equivariant_layer_norm.py": "c1b2f19f8287ed352ab5a0579469eb797a0ef8b83276b923eaf3d1408b7e0d8b",
     "fasteq/triton/fused_equivariant_gate.py": "3a9e8211dd2c16ed96f47cdcbfa30d860ef521cd23b63c69e432eacf46834858",
     "fasteq/triton/fused_gate_act.py": "b51d48663d08a6b7a9c0c71dd9fafb46618465f2c62bd1b8ca4427b55440f234",
     "fasteq/triton/fused_equivariant_dropout.py": "48444ccc2b51bf6268642fc071d4e04caa4e235354a1896aa051091db86abb3a",
@@ -18,25 +18,25 @@
     "test/test_triton_attention_alpha.py": "d9c31162b1e0d7c5768d8050479c44e4bf1fcf5837f0f1136d7136da6a14aefb",
     "test/benchmark_triton_attention_alpha.py": "9ac7baa55b72df455e079d60e79c0bc389e801570df026aceb749a6d01dbe935",
     "test/stress_triton_attention_alpha.py": "0234c75f334a0a622c20f5ba0dd9f52b7ef2a38648fd6a70eb501d2329d320cc",
-    "test/test_triton_equivariant_layer_norm.py": "bfcc9a8d17018908b44fa5a0513a52083f454fc5346883bf1c16ebffcfe59aff",
-    "test/test_triton_equivariant_layer_norm_backward.py": "d3092e73ad4e32d0def636115307fad27a3690676d4188f008423752a89992ce",
-    "test/test_triton_equivariant_layer_norm_precision.py": "33c6910d4e0d1a53302da7b5354e39816d5a9494b5a7d1f3df48c553d85537dc",
+    "test/test_triton_equivariant_layer_norm.py": "b0a514ce32dfc78c6d1d71ff4cf7e210169cb57022c748aa690a0502dece8e2a",
+    "test/test_triton_equivariant_layer_norm_backward.py": "bf046a56498ef5da13396fac90364bce9532fc06833eb42408314cd407fafe15",
+    "test/test_triton_equivariant_layer_norm_precision.py": "5749ae837b94bffe92b18741e42554374872cdbd13e4e1695301a73e3199a8e5",
     "test/eqv3_validation/cases.py": "d7ab7d2fe2963601e583b632604e0a111f08e43ec06864551ed756e8df703ebf",
     "test/eqv3_validation/run.py": "6b9e6af2a53c37c24deff4b914bcb3c1601adb5440a4bb4c85e1cba107d2b9b9",
-    "test/check_eqv3_validation_records.py": "a209fff3567501c99e831d9f6df1d181111e0362bb67fe226fbdc0af8512d405",
+    "test/check_eqv3_validation_records.py": "5057c92aab494d54a7aaf68be1ed0bfa6d908f54427e0947a161f5abc4561a02",
     "test/data/graph_softmax/h100.json": "db5b8363d6a87dfeed356a0039aae9a3c86d788bb610602a75877f210d1850f6",
     "test/data/graph_softmax/hygon.json": "1c4f4594eba5270af54fe58bd2a48a0928ffde7efadff95424b8f1db5f177ef3",
     "test/benchmark_triton_attention_alpha_matched.py": "5d3c9df94b827c9abf7d7cd96eac5483f86354171aebb643e516f925935ed738",
     "test/test_triton_graph_softmax_index.py": "d8b0f04787442c54a9329a16d64942f17298861d9b7377e970d4022b3ecf387b",
-    "test/benchmark_triton_graph_softmax_index.py": "9c05c6394b00076e3cb08f0c5abd11b9d6651bbe148fb02824d708ebfcd9af2c"
+    "test/benchmark_triton_graph_softmax_index.py": "9c05c6394b00076e3cb08f0c5abd11b9d6651bbe148fb02824d708ebfcd9af2c",
+    "test/equivariant_layer_norm_reference.py": "8b7ee107c60028bba3e93d037b5de01dd5b859f5510bf70b9fe1fc4a37665fe8",
+    "test/test_triton_equivariant_merge_layer_norm.py": "1a617c786a572c0e35d8a8b27543d6122379062e4d4532f0b028b5140e96708a",
+    "test/benchmark_triton_equivariant_layer_norm.py": "2c4566c6b2315925599b6d51bca3e2b2abd7786b7fa0c113c81d26d4bc2e350a",
+    "test/benchmark_triton_merge_layer_norm_replay.py": "adcb1698b3ddd48c01f3b47f033b5efa0d220bc49d476f451d9f51922ee3e9ed"
   },
   "groups": {
     "graph_softmax": "graph_softmax/summary.json",
     "attention_alpha": "attention_alpha/summary.json",
-    "layernorm_regression": [
-      "layernorm/h100/summary.json",
-      "layernorm/hygon/summary.json"
-    ],
     "gate": [
       "gate/h100/manifest.json",
       "gate/hygon/manifest.json"
@@ -45,16 +45,13 @@
       "dropout/h100/manifest.json",
       "dropout/hygon/manifest.json"
     ],
-    "layernorm_scaling": [
-      "norm/hygon/manifest.json",
-      "separable/hygon/manifest.json"
-    ],
-    "graph_softmax_index": "graph_softmax_index/summary.json"
+    "graph_softmax_index": "graph_softmax_index/summary.json",
+    "layernorm": "layernorm/summary.json"
   },
-  "selection_policy": "Measured runtime source must match byte for byte. Old mixed-operator archives were filtered by operator; retained point and check entries are unchanged. No mismatched-source H100 LayerNorm performance retained. Current failures are not filtered out.",
+  "selection_policy": "Measured runtime source must match byte for byte. Unchanged operators retain their matched results. LayerNorm uses the 2026-09-20 dual-platform regression and Merge benchmarks; older adapter-hash scaling records are omitted. Current failures remain recorded as known limitations.",
   "harness_adaptations": "Alpha matched benchmark uses the measured reference arithmetic, CPU-staged comparisons and rotated event sampling, with portable module paths and an optional control; diagnostic assembly dumps omitted. Current Alpha records select only current-source checks and Torch/current timing arrays without changing values. The stress helper and scaling harness retain their previously documented path adaptations. GraphSoftmax benchmark unchanged. Raw-index GraphSoftmax operator, regression suite and benchmark are byte-identical to the sources measured on both devices; raw JSON and JUnit reports are unchanged.",
   "artifacts_sha256": {
-    "REPRODUCE.md": "2253b546e46932fe6801f081faf182bc40ae5ebc610ecdb599225868d39f77e3",
+    "REPRODUCE.md": "85121b6297130320f4539b50122a07742c0f78ce1d70ade221656c686dbd33cb",
     "attention_alpha/h100/perf_131072.json": "4d50883677be9b6af18a5da21e417b1c79b8efb614d1065ef20d7bb72ab33227",
     "attention_alpha/h100/perf_32768.json": "a51eb197f3cd7947086e227326423c6e5eac4bfd0ec9c8121e901df548ef511f",
     "attention_alpha/h100/perf_4096.json": "65c83b145303e8e85f3a6ed4b77aa156b9b48beb12ef2f37f23756c5e4d9f70c",
@@ -134,24 +131,15 @@
     "graph_softmax_index/hygon/perf_random_4096.json": "338ad2e5e2db59a64d22ceac2ffa53b53495206986ca15edf9f8f09d284ee560",
     "graph_softmax_index/hygon/pytest.xml": "7f857bd17cf10a6f2453278ac8c02f4be786a31b680e1f3b9624e9dff8f33892",
     "graph_softmax_index/summary.json": "b86d860471eb419f9e227e8ea9db6e9cda43d07bba8d5d18173044d55198dc97",
-    "layernorm/h100/pytest.xml": "4b510b1a937baacca09d1ace1652d1f59bc1d456e8d26a76e7080a11fb800b82",
-    "layernorm/h100/summary.json": "c4bad9b97999a3fc0ca09894704f46cb1e5d0b3b24b4cca3f3d08f21d60e897d",
-    "layernorm/hygon/pytest.xml": "2b557c4ffc44f17eec275d11ff67dd3a79944ad3f75cc49e65d8a562b5a6385a",
-    "layernorm/hygon/summary.json": "ae58435f89b59466b118cd6723dbcbd86f5fcd3b0df0d54194ee21a259b982e4",
-    "norm/hygon/boundaries.csv": "b7fa962de671d6fa966e315ff497be51c0de5de01269495f2aa8a709b1e0ce73",
-    "norm/hygon/correctness.json": "5381b987b4dfd676ae42c93a56bf1205a1f8d63c3faaff32a7579005bad7130f",
-    "norm/hygon/extra_checks.json": "ea6110da071f0a3aad0356b273cb49d6c9d07b0a88401bb3bde85822deedaa6d",
-    "norm/hygon/failures.csv": "8d1e3fc70898f8c067428c0097d2671d2e1a28f46cb4a3fa64eb5ab3c294199b",
-    "norm/hygon/manifest.json": "bf940955d38b670275874b354d090e96e7843b0c83baf23a159e037796931df3",
-    "norm/hygon/paired.csv": "60f207f3142bbb5405b9441eac3b8209f76d9cd2c132dfcf29a169c2b61eb3cb",
-    "norm/hygon/raw_results.json.gz": "a08f3ee9753233b5b5f65e79102de3d9dc3ac15802da3ba0533541e50909d131",
-    "separable/hygon/boundaries.csv": "7db98d80fd8bbc29615a89857dc1d9ccacfb351e64779a7981aba360e26a0ebf",
-    "separable/hygon/correctness.json": "0cded39481ec4d212766f233dc6b6acb669b2a0354bb6a41d7e169ef995e79e8",
-    "separable/hygon/extra_checks.json": "9ec66bb1d250b834116b8520529741643cd4144d4596e88f483447daa24ddcb5",
-    "separable/hygon/failures.csv": "0241d9581d79199eabbe16d0607c7ed9bccd85f32aeb5bcdea9a5e1c9a2803e1",
-    "separable/hygon/manifest.json": "320e17a55dda4acae2a5c335b3519dcb2bbf9bc5dd06d482e96e33638008be3c",
-    "separable/hygon/paired.csv": "6e6789ba349a5f4d0b989cfb1257ed8dd7246e40cc6999ea062eecbe67adab39",
-    "separable/hygon/raw_results.json.gz": "058ecf4f5d73862a0af52b08a7b4b16dfffc363de72be1ef12b725e1c8860cec"
+    "layernorm/h100/matrix.json.gz": "ce09053e6b594f1788a2da620e229125484b4025c900577d9422ce2b461abced",
+    "layernorm/h100/pytest.xml": "8a6549b84727c5aed22bfc33178cd6ae10b655ddb2b38505dd0f6e0832b14e71",
+    "layernorm/h100/replay.json": "e2e541fcf1f13026a6a525dfd4cb5f820a78906d2ae5e50673c1e978fa92dd01",
+    "layernorm/hygon/known_boundary.json": "f7098fe7b4897e3c8d12754058a26d5a69f9d9fdc7c587a35dbec9130906b972",
+    "layernorm/hygon/matrix.json.gz": "30cc6e5a44bd935d025ff3ffaff870d91a08fbf49adb97b8dd8ee51a989130d9",
+    "layernorm/hygon/merge_l6_fwd_bwd_131072.log": "c6b03b942ad01f42f7c241fc2851a99baef9280bc02e58306eb3e839aee3fa43",
+    "layernorm/hygon/pytest.xml": "cfdbd04e6bf31563434a4007da4056f2ff0eb78116f8af97d2acb02ea22849b8",
+    "layernorm/hygon/replay.json": "f8c40ae1a46832d236d5178b7b1c3c08346799c8ad0e31690fae0c6153365a52",
+    "layernorm/summary.json": "736ba0583452f2c7535009a470d7c30d2b74c75af37a9a03db0f23f3c81dbd34"
   },
   "validation_policy": "Every operator code change requires relevant accuracy and performance tests on Hygon and H100 using identical source hashes. An unavailable platform remains pending; unchanged sources may retain matching evidence."
 }

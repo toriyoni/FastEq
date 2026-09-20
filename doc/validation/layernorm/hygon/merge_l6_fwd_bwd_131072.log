@@ -1,0 +1,14 @@
+/public/home/lixian_ma/ysq/equiformer_v3/equiformer_v3-a7300c58df683dc99cb48027d5bfd4c887486c48/experimental/models/equiformer_v3/layer_norm.py:53: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @torch.cuda.amp.autocast(enabled=False)
+/public/home/lixian_ma/ysq/equiformer_v3/equiformer_v3-a7300c58df683dc99cb48027d5bfd4c887486c48/experimental/models/equiformer_v3/layer_norm.py:147: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @torch.cuda.amp.autocast(enabled=False)
+/public/home/lixian_ma/ysq/equiformer_v3/equiformer_v3-a7300c58df683dc99cb48027d5bfd4c887486c48/experimental/models/equiformer_v3/layer_norm.py:246: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @torch.cuda.amp.autocast(enabled=False)
+Traceback (most recent call last):
+  File "/public/home/lixian_ma/zxb/merge_layernorm_20260920/repo/test/benchmark_triton_equivariant_layer_norm.py", line 206, in <module>
+    main()
+  File "/public/home/lixian_ma/zxb/merge_layernorm_20260920/repo/test/benchmark_triton_equivariant_layer_norm.py", line 194, in main
+    row = run_case(args, operator, nodes)
+  File "/public/home/lixian_ma/zxb/merge_layernorm_20260920/repo/test/benchmark_triton_equivariant_layer_norm.py", line 163, in run_case
+    raise AssertionError(f"{operator} N={nodes} failed original-source precision: {failed}")
+AssertionError: merge N=131072 failed original-source precision: {'affine_weight': {'numel': 896, 'max_abs': 0.001220703125, 'max_tolerance_ratio': 1.354132813346333, 'failures': 1}}

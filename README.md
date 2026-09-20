@@ -46,7 +46,8 @@ using the measured full-call cost for the intended graph distribution.
 ### Equivariant LayerNorm
 
 CUDA/HIP FP32 normalization with first-order gradients for EquiformerV3 and
-EquiformerV2 layers. See [Equivariant LayerNorm](doc/layernorm.md) for supported
+EquiformerV2 layers, including EQv3 MergeLayerNorm for inference. See
+[Equivariant LayerNorm](doc/layernorm.md) for supported
 layers, fused operations, usage, and validation coverage.
 
 See the [EQv3 validation index](doc/eqv3_validation.md) for current-source

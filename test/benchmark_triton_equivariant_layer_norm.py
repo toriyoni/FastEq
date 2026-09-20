@@ -1,7 +1,7 @@
 r"""Benchmark original Torch LayerNorm classes against the fused Triton adapter.
 
     PYTHONPATH=. FASTEQ_BACKEND=cpu python test/benchmark_triton_equivariant_layer_norm.py \
-        --v3-source /path/to/equiformer_v3/layer_norm.py --operators norm separable \
+        --v3-source /path/to/equiformer_v3/layer_norm.py --operators norm merge \
         --mode fwd_bwd --nodes 108 4096 --output layernorm_benchmark.json
 
 V2/V3 paths also accept FASTEQ_EQUIFORMER_{V2,V3}_LAYER_NORM. Each case checks
@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import statistics
+import socket
 import time
 
 import torch
@@ -27,6 +28,7 @@ from fasteq.triton.fused_equivariant_layer_norm import from_reference
 
 OPERATORS = {
     "norm": ("V3", "EquivariantLayerNorm"),
+    "merge": ("V3", "EquivariantMergeLayerNorm"),
     "separable": ("V3", "EquivariantSeparableLayerNorm"),
     "sh": ("V2", "EquivariantLayerNormArraySphericalHarmonics"),
 }
@@ -129,7 +131,8 @@ def run_case(args, operator, nodes):
     family, class_name = OPERATORS[operator]
     source_path = getattr(args, family.lower() + "_source")
     torch.manual_seed(args.seed)
-    source = load_source(source_path, class_name)(args.lmax, args.channels).cuda().train()
+    source = load_source(source_path, class_name)(args.lmax, args.channels).cuda()
+    source.train(args.mode == "fwd_bwd")
     with torch.no_grad():
         for parameter in source.parameters():
             parameter.copy_(torch.randn_like(parameter))
@@ -145,7 +148,7 @@ def run_case(args, operator, nodes):
 
     def invoke(op):
         if args.mode == "fwd":
-            with torch.no_grad():
+            with torch.inference_mode():
                 return (op(x),)
         output = op(x)
         return (output, *torch.autograd.grad(output, (x, *parameters), dy))
@@ -174,8 +177,11 @@ def main():
     folder = Path(inspect.getfile(from_reference)).parent
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     report = {"metadata": {
-        "utc": datetime.now(timezone.utc).isoformat(), "gpu": props.name,
+        "utc": datetime.now(timezone.utc).isoformat(), "host": socket.gethostname(), "gpu": props.name,
         "torch": torch.__version__, "triton": triton.__version__, "cuda": torch.version.cuda,
+        "hip": torch.version.hip,
+        "target": str(triton.runtime.driver.active.get_current_target()),
+        "forward_scope": "eval mode with torch.inference_mode",
         "dtype": "float32", "atol": 5e-5, "rtol": 5e-4,
         "timing_scope": "eager standalone calls; fwd_bwd includes forward and first-order gradients",
         "implementation_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()

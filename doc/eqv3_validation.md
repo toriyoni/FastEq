@@ -13,7 +13,7 @@ was made; an unchanged operator can retain an earlier measurement.
 | [GraphSoftmax CSR](graph_softmax.md) | 215 tests passed | 215 tests passed | Four matched graph cases per device pass. Reusable node order substantially improves the large-graph Hygon result. |
 | [GraphSoftmax raw index](graph_softmax_index.md) | 105 tests passed | 105 tests passed | 12 matched graph cases per device pass. Forward + backward is 1.11–6.00x Torch on H100 and 1.16–1.85x on Hygon. Rebuilt CSR still wins two large H100 cases. |
 | [AttentionAlpha](attention_alpha.md) | 67 tests + 13 stress cases passed | 67 tests + 13 stress cases passed | Triton forward and first-order backward. H100 forward + backward is 2.67–6.44x Torch at measured sizes; Hygon is 1.45–1.54x. |
-| [Equivariant LayerNorm](layernorm.md) | 218 tests passed | 218 tests passed; separate scaling suite has one failing Separable case | Hygon Separable affine-weight gradient at N=262,144 has two elements outside tolerance. Current-source H100 performance was not rerun. |
+| [Equivariant LayerNorm](layernorm.md) | 372 tests; Merge matrix 40/40; replay 12/12 passed | 372 tests; Merge matrix 39/40; replay 12/12 passed | Merge inference replay is 1.64–1.75x Torch on H100 and 1.84–1.89x on Hygon. One Hygon affine-weight gradient at N=131,072, Lmax=6 exceeds tolerance. |
 | [e3nn Equivariant Gate](equivariant_gate.md) | 15 shape comparisons passed | 15 shape comparisons passed | The separate EQv3 GateActivation class still lacks a callable forward. |
 | [Equivariant Dropout](equivariant_dropout.md) | 17 shape comparisons passed | 16 shape comparisons passed | Exact output/gradient agreement with a shared mask. Hygon launch error at N=2,097,152. |
 
@@ -32,8 +32,10 @@ larger-scale comparison.
 | GraphSoftmax raw index / rebuilt CSR | f11r1n20, one Hygon BW DCU, gfx936 | 2.7.1 | HCU 3.1.0 | 2026-09-18 |
 | AttentionAlpha | gxn70, physical GPU 7, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-17 |
 | AttentionAlpha | a14r2n09, one Hygon BW DCU, gfx936 | 2.7.1 | HCU 3.1.0 | 2026-09-17 |
-| LayerNorm regression; Gate / Dropout | gxn70, physical GPU 5, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-15 |
-| LayerNorm; Gate / Dropout | a14r1n09, one Hygon BW DCU, gfx936, 65,520 MiB | 2.7.1 / HIP 6.3.26045 | HCU 3.1.0 | 2026-09-16 |
+| LayerNorm regression / Merge benchmarks | gxn70, physical GPU 0, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-20 |
+| LayerNorm regression / Merge benchmarks | f11r1n05, one Hygon BW DCU, gfx936; boundary repeats on f11r1n01 | 2.7.1 / HIP 6.3.26045 | HCU 3.1.0 | 2026-09-20 |
+| Gate / Dropout | gxn70, physical GPU 5, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-15 |
+| Gate / Dropout | a14r1n09, one Hygon BW DCU, gfx936, 65,520 MiB | 2.7.1 / HIP 6.3.26045 | HCU 3.1.0 | 2026-09-16 |
 
 Gate uses e3nn 0.4.4; graph references use torch-geometric 2.6.1. H100 runs used
 a shared host without exclusive reservation or locked clocks. Compare FastEq
@@ -70,17 +72,19 @@ Reference file hashes are retained beside the operator records.
 ## Measurement method
 
 All reported timings are FP32 standalone operator calls. Forward uses
-`no_grad`; forward + backward includes all requested input and parameter
+`no_grad` (MergeLayerNorm uses `eval` + `inference_mode`); forward + backward includes all requested input and parameter
 gradients, without an optimizer. Five warmups precede 20 synchronized
 GPU-event samples; tables report medians. The raw-index GraphSoftmax comparison
 also records synchronized wall time and uses that complete-call measure in its
 tables, including per-call CSR/layout construction. Host dispatch gaps are included.
 GraphSoftmax and AttentionAlpha rotate provider order; the retained Alpha
 measurements came from a three-provider run with an independent control.
-Only current-source and Torch results are retained. The Gate/Dropout/LayerNorm
+Only current-source and Torch results are retained. The Gate/Dropout
 sweep uses a fresh process per
 implementation, mode and shape. These differences are retained rather than
-combining separate runs into a hardware comparison.
+combining separate runs into a hardware comparison. MergeLayerNorm alternates
+Torch and FastEq within each shape/mode process, including captured-model
+feature replays; those replays are standalone layers, not full-model timings.
 
 GraphSoftmax CSR reports resident node order, per-call feature packing/restoration,
 and topology preparation separately. Its raw-index comparison rebuilds both CSR
@@ -95,7 +99,7 @@ For retained scaling sweeps, N starts at 256 and doubles. `OOM` is an actual
 allocation failure; `LIMIT` or `INDEX_GUARD` stops before allocating an
 unsupported index range; `ERROR` is a runtime failure. A FastEq-only point
 beyond Torch's memory ceiling has no matched accuracy result. The latest
-GraphSoftmax and AttentionAlpha measurements are bounded representative runs,
+GraphSoftmax, AttentionAlpha and MergeLayerNorm measurements are bounded runs,
 so prior implementation OOM limits are not carried forward.
 
 ## Reproduction and records
