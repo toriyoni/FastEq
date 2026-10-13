@@ -6,6 +6,7 @@ it never calls an EQX CUDA operator or launcher.
 """
 
 import math
+import os
 from ast import literal_eval
 from collections import defaultdict
 from functools import cache, lru_cache
@@ -15,7 +16,13 @@ import torch
 
 
 @lru_cache(maxsize=128)
-def _frame_source(dtype, channels, metadata, role):
+def _frame_source(dtype, channels, metadata, role, strategy="scalar"):
+    if strategy == "vector":
+        if dtype != torch.float64 or channels != 128 or role not in (0, 2):
+            raise ValueError("Frame vector source requires FP64 C128 and feature roles")
+        return _frame_vector_source(metadata, role)
+    if strategy != "scalar":
+        raise ValueError("Unknown frame source strategy")
     degrees_in, degrees_out = literal_eval(metadata)
     ni, no = len(degrees_in), len(degrees_out)
     scalar = "double" if dtype == torch.float64 else "float"
@@ -78,6 +85,45 @@ def _frame_source(dtype, channels, metadata, role):
     """,
         grid,
     )
+
+
+@lru_cache(maxsize=128)
+def _frame_vector_source(metadata, role):
+    assert role in (0, 2)
+    degrees_in, degrees_out = literal_eval(metadata)
+    ni, no = len(degrees_in), len(degrees_out)
+    outputs, inputs = ((degrees_out, degrees_in) if role == 2
+                       else (degrees_in, degrees_out))
+    groups = []
+    for i, degree in enumerate(outputs):
+        terms = []
+        for j, other in enumerate(inputs):
+            if degree != other:
+                continue
+            coefficient = (f"matrix[(e*{no}+{i})*{ni}+{j}]" if role == 2
+                           else f"matrix[(e*{no}+{j})*{ni}+{i}]")
+            operand = (f"features+(e*{ni}+{j})*128+c" if role == 2
+                       else f"edge+(e*{no}+{j})*128+c")
+            terms.append("{"
+                f"double weight={coefficient}; const double* row={operand};"
+                "double2 p0=*reinterpret_cast<const double2*>(row);"
+                "double2 p1=*reinterpret_cast<const double2*>(row+64);"
+                "s0.x+=weight*p0.x;s0.y+=weight*p0.y;"
+                "s1.x+=weight*p1.x;s1.y+=weight*p1.y;}")
+        groups.append(f"case {i}: {{{''.join(terms)} break;}}")
+    return f"""
+    extern "C" __global__ void run(const double* features,const double* matrix,
+        const double* edge,double* result) {{
+        long long e=blockIdx.x;
+        int a=blockIdx.y*4+threadIdx.x/32,c=2*(threadIdx.x%32);
+        if(a>={len(outputs)}) return;
+        double2 s0=make_double2(0,0),s1=make_double2(0,0);
+        switch(a) {{{''.join(groups)}}}
+        double* row=result+(e*{len(outputs)}+a)*128+c;
+        *reinterpret_cast<double2*>(row)=s0;
+        *reinterpret_cast<double2*>(row+64)=s1;
+    }}
+    """, (len(outputs)+3)//4
 
 
 @lru_cache(maxsize=128)
@@ -194,14 +240,27 @@ class _Frame(torch.autograd.Function):
         ctx.kernel_metadata, ctx.role = metadata, role
         ctx.save_for_backward(*values)
         if role == 0:
-            result = torch.empty_like(features)
+            result = features.new_empty(features.shape)
         elif role == 1:
-            result = torch.zeros_like(matrix)
+            result = matrix.new_zeros(matrix.shape)
         else:
             result = features.new_empty(
                 features.shape[0], matrix.shape[1], features.shape[2]
             )
-        code, groups = _frame_source(features.dtype, features.shape[2], metadata, role)
+        # The read operand may be a contiguous view with an odd offset.
+        # Keep scalar CUDA unless both actual vector pointers are aligned.
+        vector_operand = features if role == 2 else values[2]
+        strategy = (
+            "vector"
+            if features.shape[0] >= 16384
+            and features.dtype == torch.float64 and features.shape[2] == 128
+            and role in (0, 2)
+            and os.environ.get("FASTEQ_EXPERIMENTAL_ROTATE_VECTOR") == "1"
+            and vector_operand.is_contiguous() and vector_operand.data_ptr() % 16 == 0
+            and result.is_contiguous() and result.data_ptr() % 16 == 0
+            else "scalar"
+        )
+        code, groups = _frame_source(features.dtype, features.shape[2], metadata, role, strategy)
         return _launch(code, values, result, groups)
 
     @staticmethod
