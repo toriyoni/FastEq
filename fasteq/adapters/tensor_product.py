@@ -1,6 +1,7 @@
 """Exact e3nn/O(2) path translation to existing native CUDA products."""
 
 import math
+import os
 
 import torch
 from e3nn import o3
@@ -95,26 +96,29 @@ class TensorProductPlan:
                     iz = offsets[2][ins.i_out].start // c + oi
                     iw = woff // c if ins.has_weight else module.weight_numel // c
                     rows.append(((iw, ix, iy, iz), coefficient))
-                else:
-                    terms.append(
-                        (
-                            {"uuu": 0, "u1u": 1, "uvu": 2, "uvw": 3}[
-                                ins.connection_mode
-                            ],
-                            woff,
-                            offsets[0][ins.i_in1].start + (ai * m1 if o2 else ai),
-                            1 if o2 else d1,
-                            offsets[1][ins.i_in2].start + (bi * m2 if o2 else bi),
-                            1 if o2 else d2,
-                            offsets[2][ins.i_out].start + (oi * mo if o2 else oi),
-                            1 if o2 else do,
-                            m1,
-                            m2,
-                            mo,
-                            int(ins.has_weight),
-                        )
+                # Keep an alternate sparse descriptor in the module's native
+                # layout. Small scalar-Y products can reuse FastEq's complete
+                # shared-adjoint CUDA implementation without layout copies or
+                # differentiable expansion of a shared parameter.
+                terms.append(
+                    (
+                        {"uuu": 0, "u1u": 1, "uvu": 2, "uvw": 3}[
+                            ins.connection_mode
+                        ],
+                        woff,
+                        offsets[0][ins.i_in1].start + (ai * m1 if o2 else ai),
+                        1 if o2 else d1,
+                        offsets[1][ins.i_in2].start + (bi * m2 if o2 else bi),
+                        1 if o2 else d2,
+                        offsets[2][ins.i_out].start + (oi * mo if o2 else oi),
+                        1 if o2 else do,
+                        m1,
+                        m2,
+                        mo,
+                        int(ins.has_weight),
                     )
-                    coefficients.append(coefficient)
+                )
+                coefficients.append(coefficient)
             if ins.has_weight:
                 woff += math.prod(ins.path_shape)
         self.rows = tuple(rows)
@@ -124,9 +128,15 @@ class TensorProductPlan:
             self.sizes[1] // self.ywidth,
             self.sizes[2] // self.width,
         )
+        self.segmented_metadata = repr(
+            ((self.weight_numel, *self.sizes), tuple(terms), tuple(coefficients))
+        )
+        self.scalar_y_small = (
+            uniform and scalar_y and 0 < len(terms) <= 16
+            and all(term[0] in (1, 2) and term[9] == 1 for term in terms)
+        )
         self.metadata = (
-            repr(((self.weight_numel, *self.sizes), tuple(terms), tuple(coefficients)))
-            if self.vector
+            self.segmented_metadata if self.vector
             else repr((self.width, self.dims, self.rows))
         )
 
@@ -176,7 +186,17 @@ class TensorProductPlan:
         x = x.expand(*shape, self.sizes[0]).reshape(n, self.sizes[0])
         y = y.expand(*shape, self.sizes[1]).reshape(n, self.sizes[1])
         shared = math.prod(weight.shape[:-1]) == 1
-        if not self.vector and torch.is_grad_enabled() and weight.requires_grad:
+        # The O(3) nine-term proposal regressed against existing Uniform1D in
+        # both dtypes. Keep its established kernel; enable the measured O(2)
+        # scalar-Y specialization only.
+        scalar_y_sparse = (
+            self.scalar_y_small and self.o2
+            and os.environ.get("FASTEQ_EXPERIMENTAL_UNIFORM_SCALAR_Y") == "1"
+        )
+        if (
+            not self.vector and not scalar_y_sparse
+            and torch.is_grad_enabled() and weight.requires_grad
+        ):
             # Uniform1D's forward accepts WB=1, but its existing grad_w stores
             # are owned by each edge and do not reduce a shared destination.
             # Expand only differentiable weights: autograd's CUDA broadcast
@@ -188,6 +208,11 @@ class TensorProductPlan:
             if shared
             else weight.expand(*shape, self.weight_numel).reshape(n, self.weight_numel)
         )
+        if scalar_y_sparse:
+            from fasteq.ops.segmented_product import segmented_product
+
+            result = segmented_product(self.segmented_metadata, weight, x, y)
+            return result.reshape(*shape, self.sizes[2])
         if self.dummy:
             ones = self.constants.get(
                 (x.device, x.dtype, rows, self.dummy),

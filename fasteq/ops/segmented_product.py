@@ -129,7 +129,9 @@ def _specialized_source(metadata, dtype, role, required, chunked, compact=False)
     """Constant-fold small sparse descriptors without a per-row table scan."""
     code = _source(dtype, role, required, chunked, compact)
     _, terms, coefficients = _parse(metadata)
-    if not terms or len(terms) > 8 or not all(map(math.isfinite, coefficients)):
+    scalar_y = terms and all(term[0] in (1, 2) and term[9] == 1 for term in terms)
+    limit = 16 if scalar_y else 8
+    if not terms or len(terms) > limit or not all(map(math.isfinite, coefficients)):
         return code
     marker = "for(int t=0;t<nt;++t) {"
     start = code.index(marker)
@@ -153,6 +155,32 @@ def _specialized_source(metadata, dtype, role, required, chunked, compact=False)
         # A one-iteration loop preserves each descriptor's early continue.
         blocks.append("for(int term_once=0;term_once<1;++term_once) {" + specialized + "}")
     return code[:start] + "\n".join(blocks) + code[end:]
+
+
+@lru_cache(maxsize=256)
+def _scalar_y_warp_eligible(metadata):
+    _, terms, coefficients = _parse(metadata)
+    return (0 < len(terms) <= 16 and all(map(math.isfinite, coefficients))
+            and all(term[0] in (1, 2) and term[9] == 1 and term[8] >= 32
+                    for term in terms))
+
+
+@lru_cache(maxsize=256)
+def _scalar_y_warp_source(metadata, dtype, required, chunked, compact=False):
+    """One warp contracts a scalar-Y adjoint over the channel dimension."""
+    code = _specialized_source(metadata, dtype, 2, required, chunked, compact)
+    code = code.replace(
+        "I index=(I)blockIdx.x*blockDim.x+threadIdx.x;",
+        "I index=((I)blockIdx.x*blockDim.x+threadIdx.x)/32; int lane=threadIdx.x&31;",
+    )
+    code = code.replace("for(int u=u0;u<u1;++u)",
+                        "for(int u=u0+lane;u<u1;u+=32)")
+    code = code.replace(
+        "      result[",
+        "      for(int offset=16;offset;offset/=2) total+=__shfl_down_sync(0xffffffff,total,offset);\n"
+        "      if(lane==0) result[",
+    )
+    return code
 
 
 @lru_cache(maxsize=256)
@@ -345,9 +373,15 @@ def _execute_cuda(metadata, role, required, rows, values):
         chunks = max(1, chunks)
     span = (rows + chunks - 1) // chunks
     partial = x.new_empty(chunks, width) if chunks > 1 else result
-    code = (_specialized_source(metadata, x.dtype, role, required, chunks > 1, active is not None)
-            if optimized
-            else _source(x.dtype, role, required, chunks > 1))
+    warp = (optimized and role == 2
+            and os.environ.get("FASTEQ_EXPERIMENTAL_UNIFORM_SCALAR_Y_WARP") == "1"
+            and _scalar_y_warp_eligible(metadata))
+    if warp:
+        code = _scalar_y_warp_source(metadata, x.dtype, required, chunks > 1, active is not None)
+    else:
+        code = (_specialized_source(metadata, x.dtype, role, required, chunks > 1, active is not None)
+                if optimized
+                else _source(x.dtype, role, required, chunks > 1))
     compiled = kernels([code], x.device)[code]
     args = [v.data_ptr() for v in values] + [
         descriptors.data_ptr(),
@@ -359,7 +393,7 @@ def _execute_cuda(metadata, role, required, rows, values):
         args += [span]
     if active is not None:
         args += [active.data_ptr(), width]
-    launches = [(compiled, args, (count * width + 127) // 128, chunks, 128, 0)]
+    launches = [(compiled, args, (count * width * (32 if warp else 1) + 127) // 128, chunks, 128, 0)]
     if chunks > 1:
         reduce_code = _reduction_source(x.dtype, active is not None)
         reduce_kernel = kernels([reduce_code], x.device)[reduce_code]
