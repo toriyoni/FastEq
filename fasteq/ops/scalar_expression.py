@@ -7,6 +7,7 @@ geometry operators do not require an external execution/codegen backend.
 
 import ast
 import math
+import os
 from functools import lru_cache
 
 import torch
@@ -133,7 +134,22 @@ def _parse(metadata):
 
 
 @lru_cache(maxsize=256)
-def _source(metadata, dtype):
+def _store_tile_configuration(metadata, dtype):
+    _, groups, _ = _parse(metadata)
+    widths = tuple(map(len, groups))
+    if max(widths, default=0) < 8:
+        return None
+    total = sum(widths)
+    pitch = total + (total % 2 == 0)
+    block = 128
+    size = 8 if dtype == "double" else 4
+    while block >= 32 and block * pitch * size > 32768:
+        block //= 2
+    return (block, pitch) if block >= 32 else None
+
+
+@lru_cache(maxsize=256)
+def _source(metadata, dtype, strategy="direct", block=128):
     nodes, outputs, widths = _parse(metadata)
     needed = {node for group in outputs for node in group}
     for node in reversed(range(len(nodes))):
@@ -144,8 +160,19 @@ def _source(metadata, dtype):
     code = [
         f"using T={dtype};",
         'extern "C" __global__ void run(' + ",".join(args) + "){",
-        "long long r=(long long)blockIdx.x*blockDim.x+threadIdx.x; if(r>=n)return;",
     ]
+    if strategy == "tile":
+        choice = _store_tile_configuration(metadata, dtype)
+        if choice is None or choice[0] != block:
+            raise ValueError("Scalar store tile does not match the shared-memory budget")
+        _, pitch = choice
+        code.extend((f"__shared__ T tile[{block}][{pitch}];",
+                     "long long base=(long long)blockIdx.x*blockDim.x;",
+                     "long long r=base+threadIdx.x; if(r<n){"))
+    elif strategy == "direct" and block == 128:
+        code.append("long long r=(long long)blockIdx.x*blockDim.x+threadIdx.x; if(r>=n)return;")
+    else:
+        raise ValueError("Unknown ScalarExpression store strategy or block size")
     for node, (op, *data) in enumerate(nodes):
         if node not in needed:
             continue
@@ -166,10 +193,29 @@ def _source(metadata, dtype):
             symbol = {"add": "+", "mul": "*", "div": "/", "lt": "<", "le": "<="}[op]
             expression = f"{values[0]} {symbol} {values[1]}"
         code.append(f"T v{node}={expression};")
+    offset = 0
     for slot, group in enumerate(outputs):
         code.extend(
-            f"y{slot}[r*{len(group)}+{j}]=v{node};" for j, node in enumerate(group)
+            (f"tile[threadIdx.x][{offset+j}]=v{node};" if strategy == "tile"
+             else f"y{slot}[r*{len(group)}+{j}]=v{node};")
+            for j, node in enumerate(group)
         )
+        offset += len(group)
+    if strategy == "tile":
+        # Every thread reaches the barrier, including invalid tail rows.
+        # Each output group keeps its own global stride and shared prefix.
+        code.extend(("}", "__syncthreads();"))
+        offset = 0
+        for slot, group in enumerate(outputs):
+            width = len(group)
+            if width:
+                code.append(
+                    f"for(int i=threadIdx.x;i<{block*width};i+=blockDim.x){{"
+                    f"int row=i/{width},column=i%{width};"
+                    f"if(base+row<n)y{slot}[(base+row)*{width}+column]="
+                    f"tile[row][{offset}+column];}}"
+                )
+            offset += width
     return "\n".join([*code, "}"])
 
 
@@ -195,15 +241,18 @@ def scalar_expression(metadata: str, inputs: list[torch.Tensor]) -> list[torch.T
     values = [value.contiguous() for value in inputs]
     results = [values[0].new_empty(n, len(group)) for group in outputs]
     if n and results:
-        source = _source(
-            metadata, "double" if values[0].dtype == torch.float64 else "float"
-        )
+        dtype = "double" if values[0].dtype == torch.float64 else "float"
+        choice = (_store_tile_configuration(metadata, dtype)
+                  if n >= 16384 and os.environ.get("FASTEQ_EXPERIMENTAL_WIGNER_STORE_TILE") == "1"
+                  else None)
+        strategy, block = ("tile", choice[0]) if choice else ("direct", 128)
+        source = _source(metadata, dtype, strategy, block)
         kernel = kernels([source], values[0].device)[source]
         kernel.launch(
             [value.data_ptr() for value in (*values, *results)] + [n],
-            (n + 127) // 128,
+            (n + block - 1) // block,
             1,
-            128,
+            block,
             torch.cuda.current_stream(values[0].device).cuda_stream,
         )
     return results
