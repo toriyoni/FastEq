@@ -3,6 +3,7 @@
 from ast import literal_eval
 from collections import defaultdict
 from functools import lru_cache
+import os
 
 import torch
 
@@ -121,6 +122,15 @@ def local_product(metadata, *features):
 
 class LocalSplit(torch.autograd.Function):
     """Return packed views; run native sparse CUDA for their shared adjoint."""
+
+    @classmethod
+    def apply(cls, features, ranges, metadata):
+        if (
+            os.environ.get("FASTEQ_EXPERIMENTAL_LOCAL_SPLIT_VIEW") == "1"
+            and not torch.is_grad_enabled()
+        ):
+            return tuple(features.narrow(1, start, size) for start, size in ranges)
+        return super().apply(features, ranges, metadata)
 
     @staticmethod
     def forward(ctx, features, ranges, metadata):
