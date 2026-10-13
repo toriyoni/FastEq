@@ -1,0 +1,4 @@
+include fasteq/cuda/CMakeLists.txt
+recursive-include fasteq/cuda/src *.cu *.cpp *.cuh *.h *.hpp CMakeLists.txt *.cmake
+prune fasteq/cuda/src/uniform1d_jit_codegen
+recursive-include fasteq/triton LICENSES

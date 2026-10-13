@@ -23,3 +23,10 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["fasteq*"]
+
+[tool.setuptools.package-data]
+"fasteq.cuda" = [
+  "CMakeLists.txt", "src/*.cu", "src/*.cpp", "src/*.h", "src/*.hpp", "src/*.cuh",
+  "src/**/CMakeLists.txt", "src/**/*.cmake",
+]
+"fasteq.triton" = ["LICENSES"]
