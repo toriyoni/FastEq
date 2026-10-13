@@ -9,6 +9,8 @@ and higher derivatives needed for force-loss training.
 
 from ast import literal_eval
 from functools import lru_cache
+import math
+import os
 
 import torch
 
@@ -29,8 +31,8 @@ def _tables(metadata, dtype, device):
     return dimensions, descriptors, scales
 
 
-@lru_cache(maxsize=32)
-def _source(dtype, role, required):
+@lru_cache(maxsize=256)
+def _source(dtype, role, required, chunked=False, compact=False):
     scalar = "double" if dtype == torch.float64 else "float"
     # The four operands are (weight, input1, input2, output/cotangent). An
     # unweighted path has no weight factor. Required bit zero prevents a
@@ -50,14 +52,14 @@ def _source(dtype, role, required):
     }}
     extern "C" __global__ void run(const T* a0,const T* a1,const T* a2,const T* a3,
       const int* terms,const T* scales,T* result,I count,I rows,
-      I r0,I r1,I r2,I r3,int d0,int d1,int d2,int d3,int nt) {{
+      I r0,I r1,I r2,I r3,int d0,int d1,int d2,int d3,int nt{',I span' if chunked else ''}{',const int* active,int active_width' if compact else ''}) {{
       const int dims[4]={{d0,d1,d2,d3}};
       I index=(I)blockIdx.x*blockDim.x+threadIdx.x;
-      int width=dims[{role}];
+      int width={'active_width' if compact else f'dims[{role}]'};
       if(index>=count*width) return;
-      I output_row=index/width; int coordinate=index%width;
+      I output_row=index/width; int coordinate={'active[index%width]' if compact else 'index%width'};
       T total=0;
-      I begin=count==1?0:output_row, end=count==1?rows:output_row+1;
+      I begin={'(I)blockIdx.y*span' if chunked else 'count==1?0:output_row'}, end={'min(rows,begin+span)' if chunked else 'count==1?rows:output_row+1'};
       for(I e=begin;e<end;++e) {{
         for(int t=0;t<nt;++t) {{
           const int* p=terms+12*t;
@@ -102,12 +104,212 @@ def _source(dtype, role, required):
           }}
         }}
       }}
-      result[index]=total;
+      result[{ '(I)blockIdx.y*width+index' if chunked else f'output_row*dims[{role}]+coordinate' }]=total;
     }}
     """
 
 
+@lru_cache(maxsize=4)
+def _reduction_source(dtype, compact=False):
+    scalar = "double" if dtype == torch.float64 else "float"
+    return f"""
+    using T={scalar}; using I=long long;
+    extern "C" __global__ void run(const T* partial,T* result,I width,I chunks{',const int* active' if compact else ''}) {{
+      I i=(I)blockIdx.x*blockDim.x+threadIdx.x;
+      if(i>=width) return;
+      T total=0;
+      for(I c=0;c<chunks;++c) total+=partial[c*width+i];
+      result[{'active[i]' if compact else 'i'}]=total;
+    }}
+    """
+
+
+@lru_cache(maxsize=256)
+def _specialized_source(metadata, dtype, role, required, chunked, compact=False):
+    """Constant-fold small sparse descriptors without a per-row table scan."""
+    code = _source(dtype, role, required, chunked, compact)
+    _, terms, coefficients = _parse(metadata)
+    if not terms or len(terms) > 8 or not all(map(math.isfinite, coefficients)):
+        return code
+    marker = "for(int t=0;t<nt;++t) {"
+    start = code.index(marker)
+    opening = start + len(marker) - 1
+    depth, end = 1, opening + 1
+    while depth:
+        depth += (code[end] == "{") - (code[end] == "}")
+        end += 1
+    body = code[opening + 1:end - 1]
+    declarations_start = body.index("const int* p=")
+    declarations_end = body.index("bool weighted=p[11];") + len("bool weighted=p[11];")
+    blocks = []
+    for term, coefficient in zip(terms, coefficients, strict=True):
+        names = ("mode", "wo", "xb", "xs", "yb", "ys", "zb", "zs", "c1", "c2", "co")
+        constants = "constexpr int " + ",".join(
+            f"{name}={value}" for name, value in zip(names, term[:11], strict=True)
+        ) + f"; constexpr bool weighted={'true' if term[11] else 'false'};"
+        constants += f" constexpr T coefficient=(T)({coefficient!r});"
+        specialized = body[:declarations_start] + constants + body[declarations_end:]
+        specialized = specialized.replace("scales[t]", "coefficient")
+        # A one-iteration loop preserves each descriptor's early continue.
+        blocks.append("for(int term_once=0;term_once<1;++term_once) {" + specialized + "}")
+    return code[:start] + "\n".join(blocks) + code[end:]
+
+
+@lru_cache(maxsize=256)
+def _active_coordinates(metadata, role, required, device):
+    dimensions, terms, _ = _parse(metadata)
+    ranges = []
+    estimate = 0
+    for term in terms:
+        if ((required & 1) or role == 0) and not term[11]:
+            continue
+        if role == 0:
+            size = (term[8] * term[9] * term[10] if term[0] == 3
+                    else term[8] * term[9] if term[0] == 2 else term[8])
+            base, stride = term[1], 1
+        else:
+            base, stride, size = term[2 * role], term[2 * role + 1], term[7 + role]
+        estimate += size
+        if estimate * 2 >= dimensions[role]:
+            return None
+        ranges.append((base, stride, size))
+    coordinates = sorted({base + i * stride for base, stride, size in ranges for i in range(size)})
+    with torch.inference_mode(False), torch.no_grad():
+        return torch.tensor(coordinates, dtype=torch.int32, device=device)
+
+
+@lru_cache(maxsize=32)
+def _dense_source(dtype, channels=None):
+    scalar = "double" if dtype == torch.float64 else "float"
+    source = f"""
+    using T={scalar}; using I=long long;
+    extern "C" __global__ void pack(const T* a,const T* b,T* out,int op,
+      I start,I n,I ra,I rb,int da,int db,int ba,int sa,int ca,int bb,int sb,int cb,int co) {{
+      I i=(I)blockIdx.x*blockDim.x+threadIdx.x;
+      I size=op==2?(I)ca*cb*co:n*ca*(op==1?cb:1);
+      if(i>=size) return;
+      if(op==2) {{
+        int w=i%co,u=(i/co)%ca,v=i/(co*ca);
+        out[i]=a[ba+(u*cb+v)*co+w];
+      }} else if(op==1) {{
+        I e=start+i/((I)ca*cb);int u=(i/cb)%ca,v=i%cb;
+        out[i]=a[(ra==1?0:e)*da+ba+u*sa]*b[(rb==1?0:e)*db+bb+v*sb];
+      }} else {{
+        I e=start+i/ca;int u=i%ca;
+        out[i]=a[(ra==1?0:e)*da+ba+u*sa];
+      }}
+    }}
+    extern "C" __global__ void scatter(const T* temp,const T* partner,T* out,int op,
+      I start,I n,I rp,int dp,int pb,int ps,int dout,int ob,int os,int channels,int contract,T coefficient) {{
+      I i=(I)blockIdx.x*blockDim.x+threadIdx.x;
+      if(i>=n*channels) return;
+      I row=i/channels,e=start+row;int c=i%channels;
+      T value=0;
+      if(op==0) {{
+        for(int v=0;v<contract;++v)
+          value+=temp[(row*contract+v)*channels+c]*partner[(rp==1?0:e)*dp+pb+v*ps];
+      }} else if(op==2) {{
+        for(int k=0;k<contract;++k)
+          value+=temp[(row*channels+c)*contract+k]*partner[(rp==1?0:e)*dp+pb+k*ps];
+      }} else if(op==3) {{
+        for(int k=0;k<contract;++k)
+          value+=temp[(row*contract+k)*channels+c]*partner[(rp==1?0:e)*dp+pb+k*ps];
+      }} else value=temp[i];
+      out[e*dout+ob+c*os]+=coefficient*value;
+    }}
+    extern "C" __global__ void angular_outer(const T* x,const T* y,T* out,
+      const int* terms,const T* scales,I start,I n,I rx,I ry,int dx,int dy,
+      int begin,int end,int c1,int c2) {{
+      I i=(I)blockIdx.x*blockDim.x+threadIdx.x;
+      if(i>=n*c1*c2) return;
+      I e=start+i/((I)c1*c2);int u=(i/c2)%c1,v=i%c2;
+      T total=0;
+      for(int t=begin;t<end;++t) {{
+        const int* p=terms+12*t;
+        total+=scales[t]*x[(rx==1?0:e)*dx+p[2]+u*p[3]]*y[(ry==1?0:e)*dy+p[4]+v*p[5]];
+      }}
+      out[i]=total;
+    }}
+    """
+    if channels is not None:
+        c1, c2, co = channels
+        source = source.replace(
+            "int begin,int end,int c1,int c2) {",
+            f"int begin,int end,int runtime_c1,int runtime_c2) {{ constexpr int c1={c1},c2={c2};",
+        )
+        source = source.replace(
+            "int channels,int contract,T coefficient) {",
+            "int runtime_channels,int runtime_contract,T coefficient) {"
+            + f" int channels=(op==0 || op==1)?{co}:(op==2?{c1}:{c2});"
+            + f" int contract=(op==0 || op==2)?{c2}:{c1};",
+        )
+        source = source.replace(
+            "int bb,int sb,int cb,int co) {",
+            f"int bb,int sb,int cb,int co) {{ if(op==0) ca={co};",
+        )
+    return source
+
+
+@lru_cache(maxsize=256)
+def _dense_plan(metadata, dtype, device):
+    from fasteq.cuda.jit import kernels, runtime
+    dimensions, terms, coefficients = _parse(metadata)
+    dense, scales, residual, residual_scales = [], [], [], []
+    for term, coefficient in zip(terms, coefficients, strict=True):
+        # Tiny channels and unsupported scratch shapes keep the existing
+        # FastEq CUDA contraction. Sparse angular coefficients are unchanged.
+        fixed = term[8] * term[9] * term[10] * (8 if dtype == torch.float64 else 4)
+        if term[0] == 3 and term[11] and min(term[8:11]) >= 8 and fixed < 32 * 1024 * 1024:
+            dense.append(term)
+            scales.append(coefficient)
+        else:
+            residual.append(term)
+            residual_scales.append(coefficient)
+    if not dense:
+        return None, None
+    # Group only equal shared weight tensors and equal output angular slices.
+    # CUDA fuses their sparse angular outer products before one channel GEMM.
+    groups = {}
+    for term, coefficient in zip(dense, scales, strict=True):
+        key = (term[1], term[6], term[7], *term[8:11])
+        groups.setdefault(key, []).append((term, coefficient))
+    grouped = [entry for group in groups.values() for entry in group]
+    dense, scales = zip(*grouped, strict=True)
+    channel_shapes = {tuple(term[8:11]) for term in dense}
+    channel_shape = next(iter(channel_shapes)) if len(channel_shapes) == 1 else None
+    source = _dense_source(dtype, channel_shape)
+    pack = kernels([source], device, entry="pack")[source]
+    scatter = kernels([source], device, entry="scatter")[source]
+    outer = kernels([source], device, entry="angular_outer")[source]
+    _, dense_tables, dense_scales = _tables(repr((dimensions, dense, scales)), dtype, device)
+    plan = runtime().SegmentedProductPlan(dimensions, dense, scales, pack, scatter,
+                                         outer, dense_tables, dense_scales)
+    rest = repr((dimensions, tuple(residual), tuple(residual_scales))) if residual else None
+    return plan, rest
+
+
 def _execute(metadata, role, required, rows, values):
+    if os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_GEMM") == "1":
+        x = values[1]
+        if x.is_cuda and x.dtype in (torch.float32, torch.float64):
+            # Role outputs and shared seeds must retain exactly the original
+            # broadcast domain; uncommon broadcast/per-row weights fall back.
+            supported = values[0].shape[0] == 1 and all(
+                values[r].shape[0] == rows for r in (1, 2, 3) if r != role
+            ) and (role == 0 or values[role].shape[0] in (0, rows))
+            if supported and rows:
+                if any(v.device != x.device or v.dtype != x.dtype for v in values):
+                    raise ValueError("Segmented product operands must share device and dtype")
+                plan, residual = _dense_plan(metadata, x.dtype, x.device)
+                if plan is not None:
+                    values = [v.contiguous() for v in values]
+                    seed = (_execute_cuda(residual, role, required, rows, values)
+                            if residual else x.new_empty(0))
+                    return plan.evaluate(role, required, rows, values, seed)
+    return _execute_cuda(metadata, role, required, rows, values)
+
+
+def _execute_cuda(metadata, role, required, rows, values):
     from fasteq.cuda.jit import kernels, runtime
 
     x = values[1]
@@ -122,19 +324,100 @@ def _execute(metadata, role, required, rows, values):
     result = x.new_empty(count, dimensions[role])
     if not rows or not dimensions[role]:
         return result.zero_()
-    code = _source(x.dtype, role, required)
+    optimized = os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_REDUCE") == "1"
+    active = _active_coordinates(metadata, role, required, x.device) if optimized else None
+    width = dimensions[role] if active is None else active.numel()
+    if active is not None:
+        result.zero_()
+        if not width:
+            return result
+    # Shared adjoints previously scanned every row in a single thread. Split
+    # that exact CUDA contraction into independent row tiles; only bounded
+    # partial sums are allocated, never a rows-by-weights outer-product tensor.
+    scratch_limit = 64 * 1024 * 1024
+    chunks = 1
+    if (
+        optimized
+        and count == 1 and rows > 256
+    ):
+        chunks = min(65535, (rows + 255) // 256,
+                     scratch_limit // (width * x.element_size()))
+        chunks = max(1, chunks)
+    span = (rows + chunks - 1) // chunks
+    partial = x.new_empty(chunks, width) if chunks > 1 else result
+    code = (_specialized_source(metadata, x.dtype, role, required, chunks > 1, active is not None)
+            if optimized
+            else _source(x.dtype, role, required, chunks > 1))
     compiled = kernels([code], x.device)[code]
     args = [v.data_ptr() for v in values] + [
         descriptors.data_ptr(),
         scales.data_ptr(),
-        result.data_ptr(),
+        partial.data_ptr(),
     ]
     args += [count, rows, *counts, *dimensions, descriptors.shape[0]]
+    if chunks > 1:
+        args += [span]
+    if active is not None:
+        args += [active.data_ptr(), width]
+    launches = [(compiled, args, (count * width + 127) // 128, chunks, 128, 0)]
+    if chunks > 1:
+        reduce_code = _reduction_source(x.dtype, active is not None)
+        reduce_kernel = kernels([reduce_code], x.device)[reduce_code]
+        launches.append((reduce_kernel,
+                         [partial.data_ptr(), result.data_ptr(), width, chunks] +
+                         ([active.data_ptr()] if active is not None else []),
+                         (width + 127) // 128, 1, 128, 0))
     runtime().launch(
-        [(compiled, args, (result.numel() + 127) // 128, 1, 128, 0)],
+        launches,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
     return result
+
+
+class _FeaturePair(torch.autograd.Function):
+    """Share a live DZ@W transpose within one VJP, with recursive adjoints."""
+    @staticmethod
+    def forward(ctx, metadata, required, rows, *values):
+        ctx.kernel_metadata, ctx.required, ctx.rows = metadata, required, rows
+        ctx.save_for_backward(*values)
+        ctx.set_materialize_grads(False)
+        x = values[1]
+        plan, residual = _dense_plan(metadata, x.dtype, x.device)
+        values = [v.contiguous() for v in values]
+        seedx = (_execute_cuda(residual, 1, required, rows, values)
+                 if residual else x.new_empty(0))
+        seedy = (_execute_cuda(residual, 2, required, rows, values)
+                 if residual else x.new_empty(0))
+        return tuple(plan.evaluate_features(required, rows, values, seedx, seedy))
+
+    @staticmethod
+    def backward(ctx, gradx, grady):
+        w, x, y, z = ctx.saved_tensors
+        requested = ctx.needs_input_grad[3:]
+        if os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_TASK_MASK") == "1":
+            from .equivariant_norm import _requested_gradients
+            requested = _requested_gradients(requested)
+
+        def product(role, differentiated, a, b):
+            return _Product.apply(ctx.kernel_metadata, role, ctx.required | (1 << differentiated),
+                                  ctx.rows, w, a, b, z)
+
+        def add(a, b):
+            if a is None:
+                return b
+            return a if b is None else a + b
+
+        dw = None
+        if requested[0]:
+            dw = add(product(0, 1, gradx, y) if gradx is not None else None,
+                     product(0, 2, x, grady) if grady is not None else None)
+        dx = product(1, 2, x, grady) if requested[1] and grady is not None else None
+        dy = product(2, 1, gradx, y) if requested[2] and gradx is not None else None
+        dz = None
+        if requested[3]:
+            dz = add(product(3, 1, gradx, y) if gradx is not None else None,
+                     product(3, 2, x, grady) if grady is not None else None)
+        return None, None, None, dw, dx, dy, dz
 
 
 class _Product(torch.autograd.Function):
@@ -153,18 +436,31 @@ class _Product(torch.autograd.Function):
     def backward(ctx, gradient):
         values = list(ctx.saved_tensors)
         values[ctx.role] = gradient
-        grads = [
-            _Product.apply(
-                ctx.kernel_metadata,
-                role,
-                ctx.required | (1 << ctx.role),
-                ctx.rows,
-                *values,
-            )
-            if role != ctx.role and need
-            else None
-            for role, need in enumerate(ctx.needs_input_grad[4:])
-        ]
+        requested = ctx.needs_input_grad[4:]
+        if os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_TASK_MASK") == "1":
+            from .equivariant_norm import _requested_gradients
+            requested = _requested_gradients(requested)
+        feature_pair = None
+        if (ctx.role in (0, 3) and requested[1] and requested[2]
+                and os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_GEMM") == "1"
+                and os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_PAIR") == "1"
+                and values[0].shape[0] == 1 and ctx.rows
+                and all(values[r].shape[0] == ctx.rows for r in (1, 2, 3))):
+            plan, _ = _dense_plan(ctx.kernel_metadata, values[1].dtype, values[1].device)
+            if plan is not None:
+                feature_pair = _FeaturePair.apply(ctx.kernel_metadata,
+                                                 ctx.required | (1 << ctx.role),
+                                                 ctx.rows, *values)
+        grads = []
+        for role, need in enumerate(requested):
+            if role == ctx.role or not need:
+                grads.append(None)
+            elif feature_pair is not None and role in (1, 2):
+                grads.append(feature_pair[role - 1])
+            else:
+                grads.append(_Product.apply(ctx.kernel_metadata, role,
+                                            ctx.required | (1 << ctx.role),
+                                            ctx.rows, *values))
         return None, None, None, None, *grads
 
 

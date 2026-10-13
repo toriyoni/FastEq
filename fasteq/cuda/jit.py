@@ -44,6 +44,10 @@ def runtime():
     if modulation.exists():
         sources.append(modulation)
         flags.append("-DFASTEQ_MODULATION")
+    segmented = directory / "segmented_product_plan.cpp"
+    if segmented.exists():
+        sources.append(segmented)
+        flags.append("-DFASTEQ_SEGMENTED_PRODUCT")
     with _lock:
         return load(
             name="fasteq_cuda_jit",
