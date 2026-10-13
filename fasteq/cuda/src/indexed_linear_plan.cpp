@@ -2,7 +2,9 @@
 #include "jit_runtime.h"
 
 #include <ATen/ATen.h>
+#include <ATen/Context.h>
 #include <c10/core/InferenceMode.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/autograd/functions/utils.h>
 #include <torch/csrc/autograd/saved_variable.h>
@@ -11,12 +13,29 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace py = pybind11;
 using Tensor = at::Tensor;
 using Operands = std::array<Tensor, 3>;
 using Kernel = fasteq_jit::Kernel;
+
+namespace fasteq_jit {
+// Reusable FastEq host primitive for a CUDA matrix group. ATen dispatches
+// to cuBLAS; the caller supplies legal strided views and owns autograd.
+// No tensor address, layout, or live parameter value is cached here.
+void gemm_into(Tensor& destination, const Tensor& left, const Tensor& right,
+               double alpha, double beta) {
+    at::NoTF32Guard full_precision;
+    at::addmm_out(destination, destination, left, right, beta, alpha);
+}
+void batched_gemm_into(Tensor& destination, const Tensor& left, const Tensor& right,
+                       double alpha, double beta) {
+    at::NoTF32Guard full_precision;
+    at::baddbmm_out(destination, destination, left, right, beta, alpha);
+}
+}  // namespace fasteq_jit
 
 namespace {
 struct LinearPlan;
@@ -78,6 +97,10 @@ struct LinearDerivative : torch::autograd::Node {
 };
 
 struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
+    struct GemmPath {
+        int64_t sx, sw, sy, ci, co, dim;
+        double scale;
+    };
     std::vector<std::shared_ptr<Kernel>> kernels;
     Tensor paths, scales;
     std::vector<Tensor> groups, path_ids, tiles;
@@ -86,6 +109,7 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
     std::vector<bool> covered;
     std::array<Tensor, 3> mma_tiles;
     int mma_max_dim = 0;
+    std::vector<GemmPath> gemm_paths;
 
     LinearPlan(std::vector<std::shared_ptr<Kernel>> ks, Tensor ps, Tensor cs,
                std::vector<Tensor> gs, std::vector<Tensor> ids, std::vector<Tensor> ts,
@@ -101,6 +125,112 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
                     && paths.size(1) == 6 && scales.numel() == paths.size(0), "Invalid path metadata");
     }
 
+    Tensor shared_weight_partials(const Operands& values, int64_t nodes) const {
+        const auto& prototype = values[0];
+        const auto bytes = experts * numel * prototype.element_size();
+        const auto max_chunks = std::max<int64_t>(1, (64LL << 20) / bytes);
+        int64_t span = 32;
+        if ((nodes + 31) / 32 > max_chunks)
+            span = (((nodes + max_chunks - 1) / max_chunks + 31) / 32) * 32;
+        const auto chunks = (nodes + span - 1) / span;
+        const auto full = nodes / span, tail = nodes % span;
+        auto partial = at::empty({chunks, 1, experts, numel}, prototype.options());
+        auto result = at::empty({1, experts, numel}, prototype.options());
+        if (!covered[1]) result.zero_();
+        std::set<std::array<int64_t, 2>> written;
+        for (const auto& path : gemm_paths) {
+            for (int64_t expert = 0; expert < experts; ++expert) {
+                auto pack = [&](const Tensor& original, int64_t width, int64_t base, int64_t channels) {
+                    const auto value = original.contiguous();
+                    const auto offset = base + (ir_mul ? expert * channels : expert * channels * path.dim);
+                    return value.as_strided({nodes, path.dim, channels},
+                        {width, ir_mul ? experts * channels : 1, ir_mul ? 1 : path.dim},
+                        value.storage_offset() + offset).contiguous().view({nodes * path.dim, channels});
+                };
+                auto x = pack(values[0], din, path.sx, path.ci);
+                auto y = pack(values[2], dout, path.sy, path.co);
+                const bool first = written.insert({path.sw, expert}).second;
+                if (full) {
+                    auto left = x.narrow(0, 0, full * span * path.dim).view({full, span * path.dim, path.ci}).transpose(1, 2);
+                    auto right = y.narrow(0, 0, full * span * path.dim).view({full, span * path.dim, path.co});
+                    auto destination = partial.as_strided({full, path.ci, path.co},
+                        {experts * numel, path.co, 1}, expert * numel + path.sw);
+                    fasteq_jit::batched_gemm_into(destination, left, right, path.scale, first ? 0 : 1);
+                }
+                if (tail) {
+                    auto left = x.narrow(0, full * span * path.dim, tail * path.dim).t();
+                    auto right = y.narrow(0, full * span * path.dim, tail * path.dim);
+                    auto destination = partial.as_strided({path.ci, path.co}, {path.co, 1},
+                        (full * experts + expert) * numel + path.sw);
+                    fasteq_jit::gemm_into(destination, left, right, path.scale, first ? 0 : 1);
+                }
+            }
+        }
+        std::vector<uint64_t> args{reinterpret_cast<uint64_t>(partial.data_ptr()), 0, 0, 0,
+            reinterpret_cast<uint64_t>(result.data_ptr()), reinterpret_cast<uint64_t>(paths.data_ptr()),
+            reinterpret_cast<uint64_t>(scales.data_ptr()), reinterpret_cast<uint64_t>(groups[1].data_ptr()),
+            reinterpret_cast<uint64_t>(path_ids[1].data_ptr()), reinterpret_cast<uint64_t>(tiles[1].data_ptr()),
+            uint64_t(nodes), uint64_t(din), uint64_t(dout), uint64_t(numel), uint64_t(experts),
+            uint64_t(ir_mul), 1, uint64_t(tiles[1].size(0)), uint64_t(chunks), uint64_t(span)};
+        const auto stream = reinterpret_cast<uint64_t>(c10::cuda::getCurrentCUDAStream(result.get_device()).stream());
+        kernels[3]->launch(args, tiles[1].size(0), 1, 128, stream);
+        return result;
+    }
+
+    Tensor shared_gemm(int role, const Operands& values, int64_t nodes) const {
+        const auto& prototype = values[(role + 1) % 3];
+        c10::cuda::CUDAGuard device_guard(prototype.device());
+        if (role == 1 && prototype.scalar_type() == at::kFloat && nodes >= 8192)
+            return shared_weight_partials(values, nodes);
+        Operands inputs;
+        for (int k = 0; k < 3; ++k) if (k != role) inputs[k] = values[k].contiguous();
+        const auto shape = role == 1 ? std::vector<int64_t>{1, experts, numel}
+                                   : std::vector<int64_t>{nodes, role == 0 ? din : dout};
+        auto result = at::empty(shape, prototype.options());
+        if (!covered[role]) result.zero_();
+        std::set<std::array<int64_t, 4>> written;
+        auto feature = [&](const Tensor& value, int64_t width, int64_t base,
+                           int64_t channels, int64_t dim, int64_t expert, int64_t angle) {
+            const auto offset = base + (ir_mul ? angle * experts * channels + expert * channels
+                                              : expert * channels * dim + angle);
+            return value.as_strided({nodes, channels}, {width, ir_mul ? 1 : dim},
+                                    value.storage_offset() + offset);
+        };
+        for (const auto& path : gemm_paths) {
+            for (int64_t expert = 0; expert < experts; ++expert) {
+                Tensor w;
+                if (role != 1)
+                    w = inputs[1].as_strided({path.ci, path.co}, {path.co, 1},
+                                             inputs[1].storage_offset() + expert * numel + path.sw);
+                for (int64_t angle = 0; angle < path.dim; ++angle) {
+                    Tensor left, right, destination;
+                    std::array<int64_t, 4> key;
+                    if (role == 1) {
+                        left = feature(inputs[0], din, path.sx, path.ci, path.dim, expert, angle).t();
+                        right = feature(inputs[2], dout, path.sy, path.co, path.dim, expert, angle);
+                        destination = result.as_strided({path.ci, path.co}, {path.co, 1},
+                                                        expert * numel + path.sw);
+                        key = {path.sw, expert, 0, 0};
+                    } else if (role == 0) {
+                        left = feature(inputs[2], dout, path.sy, path.co, path.dim, expert, angle);
+                        right = w.t();
+                        destination = feature(result, din, path.sx, path.ci, path.dim, expert, angle);
+                        key = {path.sx, expert, angle, path.dim};
+                    } else {
+                        left = feature(inputs[0], din, path.sx, path.ci, path.dim, expert, angle);
+                        right = w;
+                        destination = feature(result, dout, path.sy, path.co, path.dim, expert, angle);
+                        key = {path.sy, expert, angle, path.dim};
+                    }
+                    const bool first = written.insert(key).second;
+                    fasteq_jit::gemm_into(destination, left, right,
+                                          path.scale, first ? 0 : 1);
+                }
+            }
+        }
+        return result;
+    }
+
     Tensor launch(int role, const Tensor& node_types, const Operands& original, int64_t elements) const {
         TORCH_CHECK(role >= 0 && role < 3, "Invalid Linear transpose role");
         Operands inputs;
@@ -111,6 +241,10 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
         TORCH_CHECK(prototype.scalar_type() == scales.scalar_type(), "Linear plan dtype mismatch");
         TORCH_CHECK(node_types.dim() == 1 && node_types.scalar_type() == at::kLong, "Expected int64 node types");
         const auto nodes = node_types.numel();
+        if (elements == 1 && nodes >= 1024 && !gemm_paths.empty() &&
+            !(role == 1 && prototype.scalar_type() == at::kFloat && nodes >= 8192 &&
+              experts * numel * prototype.element_size() > (64LL << 20)))
+            return shared_gemm(role, original, nodes);
         int chunks = role == 1 ? (nodes + 31) / 32 : 1;
         int64_t chunk_span = 32;
         const bool tensor_core = elements == 1 && nodes >= 1024
@@ -214,6 +348,23 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
         mma_tiles = {std::move(dx), std::move(dw), std::move(forward)};
         mma_max_dim = max_dim;
     }
+
+    void configure_shared_gemm(const std::vector<std::vector<int64_t>>& descriptions,
+                               const std::vector<double>& coefficients) {
+        TORCH_CHECK(descriptions.size() == size_t(paths.size(0)) &&
+                    coefficients.size() == descriptions.size(), "Invalid shared GEMM paths");
+        std::vector<GemmPath> records;
+        for (size_t i = 0; i < descriptions.size(); ++i) {
+            const auto& p = descriptions[i];
+            TORCH_CHECK(p.size() == 6 && p[3] >= 64 && p[4] >= 64 && p[5] > 0 &&
+                        p[0] >= 0 && p[0] + experts * p[3] * p[5] <= din &&
+                        p[2] >= 0 && p[2] + experts * p[4] * p[5] <= dout &&
+                        p[1] >= 0 && p[1] + p[3] * p[4] <= numel,
+                        "Invalid shared GEMM descriptor");
+            records.push_back({p[0], p[1], p[2], p[3], p[4], p[5], coefficients[i]});
+        }
+        gemm_paths = std::move(records);
+    }
 };
 
 Tensor evaluate(const std::shared_ptr<LinearPlan>& plan, int role, const Tensor& types,
@@ -241,5 +392,6 @@ void bind_indexed_linear(py::module_& module) {
         .def("contract", &LinearPlan::contract, py::call_guard<py::gil_scoped_release>())
         .def("configure_tensor_core", &LinearPlan::configure_tensor_core)
         .def("configure_derivative_tensor_core", &LinearPlan::configure_derivative_tensor_core)
-        .def("configure_simt_tiles", &LinearPlan::configure_simt_tiles);
+        .def("configure_simt_tiles", &LinearPlan::configure_simt_tiles)
+        .def("configure_shared_gemm", &LinearPlan::configure_shared_gemm);
 }

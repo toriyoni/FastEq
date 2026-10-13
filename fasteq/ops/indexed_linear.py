@@ -183,6 +183,15 @@ def _plan(metadata, dtype, device):
               for table in (grouped_tiles[0], weight_tiles, grouped_tiles[1])],
             max(p[5] for p in paths),
         )
+    if (
+        os.environ.get("FASTEQ_EXPERIMENTAL_LINEAR_GEMM") == "1"
+        and paths
+        and all(p[3] >= 64 and p[4] >= 64 for p in paths)
+    ):
+        # Reuse FastEq's bilinear host/autograd plan, with full-precision CUDA
+        # GEMM for large shared matrices. Small/indexed-element maps retain the
+        # existing kernels. Set the opt-in before first cached plan creation.
+        plan.configure_shared_gemm([p[:6] for p in paths], [p[6] for p in paths])
     return plan
 
 
