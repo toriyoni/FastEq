@@ -256,6 +256,12 @@ def indexed_linear(metadata, features, weight, node_type):
             weight,
             features.new_empty((0,)),
         )
+    if os.environ.get("FASTEQ_LINEAR_INFERENCE", "1") != "0":
+        from .inference_linear import try_inference_linear
+
+        output = try_inference_linear(metadata, features, weight, node_type)
+        if output is not None:
+            return output
     if os.environ.get("FASTEQ_EXPERIMENTAL_LINEAR_WGMMA") == "1":
         from .wgmma_linear import eligible, wgmma_linear
         if eligible(metadata, features, weight):

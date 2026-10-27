@@ -112,6 +112,14 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
     std::vector<GemmPath> gemm_paths;
     // Cached once at shared-GEMM configuration; launch never scans paths or queries the device.
     bool adaptive_o3_c64_h100 = false;
+    // FastEq's SO(3) serial forward / input transpose, compiled once
+    // by Triton and launched through the same resident CUDA driver as the
+    // original kernels. Autograd remains in LinearDerivative, which prunes
+    // dW when a caller requests only position/input derivatives.
+    // Slots 0/2 are dX/forward; slot 1 packs W.T for dX (not the dW kernel).
+    std::array<std::shared_ptr<Kernel>, 3> serial_kernels;
+    std::array<std::array<int64_t, 4>, 3> serial_launch;
+    int64_t serial_nodes = 0;
 
     LinearPlan(std::vector<std::shared_ptr<Kernel>> ks, Tensor ps, Tensor cs,
                std::vector<Tensor> gs, std::vector<Tensor> ids, std::vector<Tensor> ts,
@@ -243,6 +251,37 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
         TORCH_CHECK(prototype.scalar_type() == scales.scalar_type(), "Linear plan dtype mismatch");
         TORCH_CHECK(node_types.dim() == 1 && node_types.scalar_type() == at::kLong, "Expected int64 node types");
         const auto nodes = node_types.numel();
+        if (role != 1 && serial_kernels[role] && nodes == serial_nodes
+            && elements == 1 && experts == 1 && prototype.scalar_type() == at::kFloat) {
+            c10::cuda::CUDAGuard device_guard(prototype.device());
+            auto weight = original[1].contiguous();
+            auto feature = original[role == 2 ? 0 : 2].contiguous();
+            // Resident executables specialize aligned pointers. A contiguous
+            // view may still have a storage offset, so retain the original
+            // kernels for unaligned operands instead of violating that ABI.
+            if (reinterpret_cast<uint64_t>(weight.data_ptr()) % 16 == 0
+                && reinterpret_cast<uint64_t>(feature.data_ptr()) % 16 == 0) {
+                auto result = at::empty({nodes, role == 2 ? dout : din}, prototype.options());
+                const auto& config = serial_launch[role];
+                const auto stream = reinterpret_cast<uint64_t>(
+                    c10::cuda::getCurrentCUDAStream(result.get_device()).stream());
+                if (role == 0) {
+                    auto packed = at::empty_like(weight);
+                    const auto& pack = serial_launch[1];
+                    serial_kernels[1]->launch(
+                        {reinterpret_cast<uint64_t>(weight.data_ptr()),
+                         reinterpret_cast<uint64_t>(packed.data_ptr()), 0},
+                        pack[0], pack[1], pack[2], stream, pack[3]);
+                    weight = std::move(packed);
+                }
+                serial_kernels[role]->launch(
+                    {reinterpret_cast<uint64_t>(weight.data_ptr()),
+                     reinterpret_cast<uint64_t>(feature.data_ptr()),
+                     reinterpret_cast<uint64_t>(result.data_ptr()), 0},
+                    config[0], config[1], config[2], stream, config[3]);
+                return result;
+            }
+        }
         // Reuse only already-configured FastEq fused tiles in the measured exact O(3) domain.
         // FP64 forward above the measured-safe R49152 keeps shared GEMM; derivatives retain fusion.
         const bool adaptive_fused = adaptive_o3_c64_h100 && elements == 1
@@ -334,6 +373,27 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
 
     Tensor contract(int role, const Tensor& types, const Tensor& x, const Tensor& w, const Tensor& y) {
         return evaluate(shared_from_this(), role, types, {x, w, y}, w.size(0));
+    }
+
+    void configure_serial(std::vector<std::shared_ptr<Kernel>> executables,
+                          const std::vector<std::vector<int64_t>>& launches,
+                          int64_t nodes) {
+        TORCH_CHECK(executables.size() == 3 && launches.size() == 3 && nodes > 0
+                    && experts == 1 && !ir_mul && scales.scalar_type() == at::kFloat,
+                    "Invalid shared SO(3) Linear configuration");
+        for (int k = 0; k < 3; ++k) {
+            const auto& config = launches[k];
+            TORCH_CHECK(executables[k] && config.size() == 4
+                        && config[0] > 0 && config[0] < (1LL << 31)
+                        && config[1] > 0 && config[1] <= 65535
+                        && config[2] > 0 && config[2] <= 1024
+                        && config[3] >= 0 && config[3] <= 49152,
+                        "Invalid shared SO(3) Linear launch");
+            const int role = k == 0 ? 2 : k == 1 ? 0 : 1;
+            serial_kernels[role] = std::move(executables[k]);
+            std::copy(config.begin(), config.end(), serial_launch[role].begin());
+        }
+        serial_nodes = nodes;
     }
 
     void configure_tensor_core(Tensor table, int max_dim) {
@@ -434,6 +494,7 @@ void bind_indexed_linear(py::module_& module) {
                       int64_t, int64_t, int64_t, int64_t, bool, std::vector<bool>>())
         .def("forward", &LinearPlan::forward, py::call_guard<py::gil_scoped_release>())
         .def("contract", &LinearPlan::contract, py::call_guard<py::gil_scoped_release>())
+        .def("configure_serial", &LinearPlan::configure_serial)
         .def("configure_tensor_core", &LinearPlan::configure_tensor_core)
         .def("configure_derivative_tensor_core", &LinearPlan::configure_derivative_tensor_core)
         .def("configure_simt_tiles", &LinearPlan::configure_simt_tiles)
