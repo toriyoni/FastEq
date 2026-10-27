@@ -1745,6 +1745,7 @@ def _build_bwd_jit_candidates(
         use_multiwarp_candidates
     )
 
+    warp_reduce = mode == "u,u,,u" and _env_bool("FASTEQ_EXPERIMENTAL_U1D_SCALAR_REDUCE", False)
     fast_key = _make_candidate_fast_key(
         kind="BWD",
         i_list=i_list,
@@ -1764,6 +1765,7 @@ def _build_bwd_jit_candidates(
         grad_w=grad_w,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
+    fast_key = (fast_key, warp_reduce)
     cached_tune_key = _BWD_TUNE_KEY_FAST_CACHE.get(fast_key)
     if cached_tune_key is not None:
         cached_best = _BWD_BEST_CANDIDATE_CACHE.get(cached_tune_key)
@@ -1821,6 +1823,8 @@ def _build_bwd_jit_candidates(
             v_dim=v_dim,
             use_multiwarp_candidates=use_multiwarp_candidates,
         )
+        if warp_reduce:
+            tune_key += "_warpreduce_v1"
         _BWD_TUNE_KEY_FAST_CACHE[fast_key] = tune_key
 
     if tune_key in _BWD_BEST_CANDIDATE_CACHE:
@@ -1966,6 +1970,7 @@ def _build_double_bwd_jit_candidates(
         use_multiwarp_candidates
     )
 
+    split_outputs = _env_bool("FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT", False)
     fast_key = _make_candidate_fast_key(
         kind="DOUBLE_BWD",
         i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
@@ -1975,6 +1980,7 @@ def _build_double_bwd_jit_candidates(
         mode=mode, dtype_str=dtype_str, grad_w=grad_w,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
+    fast_key = (fast_key, split_outputs)
     tune_key = _DOUBLE_BWD_TUNE_KEY_FAST_CACHE.get(fast_key)
     if tune_key is None:
         i_cpu = _tensor_to_cpu_list(i_list)
@@ -1994,6 +2000,8 @@ def _build_double_bwd_jit_candidates(
             ky_dim=ky_dim, v_dim=v_dim,
             use_multiwarp_candidates=use_multiwarp_candidates,
         )
+        if split_outputs:
+            tune_key += "_splitacc_v1"
         _DOUBLE_BWD_TUNE_KEY_FAST_CACHE[fast_key] = tune_key
 
     cached_best = _DOUBLE_BWD_BEST_CANDIDATE_CACHE.get(tune_key)
@@ -2025,7 +2033,7 @@ def _build_double_bwd_jit_candidates(
         input_indices=input_indices, output_indices=output_indices,
         u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
         mode=mode, need_grad_w=grad_w,
-        out_path="", profile=False, profile_print=False,
+        out_path="", profile=False, profile_print=False, split_outputs=split_outputs,
     )
     raw_candidates = _normalize_codegen_candidates(codegen_out)
     if not raw_candidates:

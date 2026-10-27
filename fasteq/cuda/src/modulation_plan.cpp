@@ -1,4 +1,4 @@
-// Native host/autograd plan for FastEq's existing Triton modulation kernels.
+// Native host/autograd plan for FastEq's hand-written CUDA modulation kernels.
 #include "jit_runtime.h"
 
 #include <ATen/ATen.h>
@@ -185,7 +185,6 @@ struct ModulationPlan : std::enable_shared_from_this<ModulationPlan> {
 
     void launch(const Executable& executable, std::vector<uint64_t>& pointers,
                 int64_t rows) const {
-        pointers.push_back(0);  // Triton's checked, unused global-scratch ABI slot.
         const auto stream = c10::cuda::getCurrentCUDAStream(index.get_device()).stream();
         executable.kernel->launch(pointers, rows, 1, executable.threads,
                                  reinterpret_cast<uint64_t>(stream), executable.shared);

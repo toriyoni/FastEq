@@ -1,6 +1,6 @@
-"""Source-preserving Gate metadata for the existing FastEq Triton kernels.
+"""Source-preserving Gate metadata for FastEq's native CUDA extension.
 
-The execution kernels are reused from FastEq d37eaca. e3nn, Prophet and EQX O(2)
+The activation/adjoint primitives extend FastEq d37eaca. e3nn, Prophet and EQX O(2)
 modules only supply their interface descriptions, activation constants, and
 permutations; no EQX executor, compiler, launcher or autograd backend is called.
 """
@@ -10,7 +10,7 @@ import math
 
 import torch
 
-from ..triton.fused_equivariant_gate import FastGateFunction, act_code
+from .native_gate import FastGateFunction, act_code
 
 
 def _activation(act):
@@ -50,7 +50,7 @@ def _activated(indices, module):
 class GatePlan:
     """e3nn/O(2)/Prophet Gate using FastEq's fused first/second-order kernels."""
 
-    backend = "FastEq Triton Gate (reused d37eaca, source constants/layout)"
+    backend = "FastEq native CUDA Gate (source constants/layout, analytic adjoints)"
 
     def __init__(self, module, kind):
         if kind not in ("o3", "o2", "prophet"):

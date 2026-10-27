@@ -7,7 +7,8 @@ import torch
 
 from fasteq.ops.indexed_linear import IndexedLinear
 from fasteq.ops.modulation import ModulatedResidualPlan
-from fasteq.triton.irreps_invariants import InvariantPlan
+from fasteq.ops.native_invariants import InvariantPlan
+from fasteq.ops.native_bias import native_bias_add
 
 from .cache import TensorCache, indices
 
@@ -78,22 +79,8 @@ class LinearPlan:
         )
         output = self.element(features, weights, indices(x, n, sequence=not shared))
         if self.bias_numel:
-            mask = self.constants.get(
-                (x.device, x.dtype, "bias_mask"),
-                lambda: x.new_tensor([float(i >= 0) for i in self.bias_map]),
-            )
-            mapping = self.constants.get(
-                (x.device, "bias_index"),
-                lambda: torch.tensor(
-                    [max(0, i) for i in self.bias_map], device=x.device
-                ),
-            )
-            biases = (
-                bias.reshape(1, self.bias_numel)
-                if bias_shared
-                else bias.expand(*shape, self.bias_numel).reshape(n, self.bias_numel)
-            )
-            output = output + biases.index_select(1, mapping) * mask
+            output = native_bias_add(output, bias, self.bias_map, shape,
+                                     shared=bias_shared)
         return output.reshape(*shape, self.dout)
 
 

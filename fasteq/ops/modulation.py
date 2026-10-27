@@ -13,7 +13,7 @@ import triton.language as tl
 from torch.autograd.function import once_differentiable
 from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
-from ..cuda.triton_launch import launch_triton, prepare_triton
+from .native_modulation import launch as launch_native, prepare as prepare_native
 from ..triton.fused_equivariant_gate import _activation
 from .equivariant_norm import _part_partial, _requested_gradients
 
@@ -266,7 +266,7 @@ class _NativeCompiler:
     def launch(self, fn, arguments, x, **extra):
         kwargs = self.kwargs(x)
         kwargs.update(extra)
-        launch_triton(fn, arguments, x, kwargs, self._launchers)
+        launch_native(fn, arguments, x, kwargs, self._launchers)
 
     @staticmethod
     def _specialization(stage, requested, seeds):
@@ -284,7 +284,7 @@ class _NativeCompiler:
         fn, extra = self._specialization(stage, requested, seeds)
         kwargs = self.kwargs(arguments[0])
         kwargs.update(extra)
-        return prepare_triton(fn, arguments, arguments[0], kwargs, self._launchers)
+        return prepare_native(fn, arguments, arguments[0], kwargs, self._launchers)
 
     def fallback_forward(self, x, gates, residual):
         return _Modulation.apply(x, gates, residual, self)
@@ -300,7 +300,7 @@ class _NativeCompiler:
 
 
 class ModulatedResidualPlan:
-    backend = "FastEq fused Gate modulation/residual with selective analytic adjoints"
+    backend = "FastEq native CUDA fused Gate modulation/residual with selective analytic adjoints"
 
     def __init__(self, irreps):
         parts, index, offset, channel = [], [], 0, 0
@@ -348,7 +348,7 @@ class ModulatedResidualPlan:
     def launch(self, fn, arguments, x, **extra):
         kwargs = self.kwargs(x)
         kwargs.update(extra)
-        launch_triton(fn, arguments, x, kwargs, self._launchers)
+        launch_native(fn, arguments, x, kwargs, self._launchers)
 
     def __call__(self, projected, gates, residual):
         if not projected.is_cuda or projected.dtype not in (

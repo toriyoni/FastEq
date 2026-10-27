@@ -12,6 +12,8 @@
 #include <pybind11/stl.h>
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <set>
 #include <vector>
@@ -22,18 +24,16 @@ using Operands = std::array<Tensor, 3>;
 using Kernel = fasteq_jit::Kernel;
 
 namespace fasteq_jit {
-// Reusable FastEq host primitive for a CUDA matrix group. ATen dispatches
-// to cuBLAS; the caller supplies legal strided views and owns autograd.
-// No tensor address, layout, or live parameter value is cached here.
+// Reusable FastEq matrix primitive. The CUDA implementation extends FastEq's
+// own indexed Linear SIMT tiles and original FP64 MMA/async-copy primitives.
+// The caller supplies legal strided views and owns the recursive autograd.
 void gemm_into(Tensor& destination, const Tensor& left, const Tensor& right,
                double alpha, double beta) {
-    at::NoTF32Guard full_precision;
-    at::addmm_out(destination, destination, left, right, beta, alpha);
+    native_gemm_into(destination, left, right, alpha, beta);
 }
 void batched_gemm_into(Tensor& destination, const Tensor& left, const Tensor& right,
                        double alpha, double beta) {
-    at::NoTF32Guard full_precision;
-    at::baddbmm_out(destination, destination, left, right, beta, alpha);
+    native_gemm_into(destination, left, right, alpha, beta);
 }
 }  // namespace fasteq_jit
 
@@ -110,6 +110,8 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
     std::array<Tensor, 3> mma_tiles;
     int mma_max_dim = 0;
     std::vector<GemmPath> gemm_paths;
+    // Cached once at shared-GEMM configuration; launch never scans paths or queries the device.
+    bool adaptive_o3_c64_h100 = false;
 
     LinearPlan(std::vector<std::shared_ptr<Kernel>> ks, Tensor ps, Tensor cs,
                std::vector<Tensor> gs, std::vector<Tensor> ids, std::vector<Tensor> ts,
@@ -241,16 +243,29 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
         TORCH_CHECK(prototype.scalar_type() == scales.scalar_type(), "Linear plan dtype mismatch");
         TORCH_CHECK(node_types.dim() == 1 && node_types.scalar_type() == at::kLong, "Expected int64 node types");
         const auto nodes = node_types.numel();
-        if (elements == 1 && nodes >= 1024 && !gemm_paths.empty() &&
+        // Reuse only already-configured FastEq fused tiles in the measured exact O(3) domain.
+        // FP64 forward above the measured-safe R49152 keeps shared GEMM; derivatives retain fusion.
+        const bool adaptive_fused = adaptive_o3_c64_h100 && elements == 1
+            && nodes >= 1024 && nodes <= 131072
+            && (prototype.scalar_type() == at::kFloat || prototype.scalar_type() == at::kDouble)
+            && !(role == 2 && prototype.scalar_type() == at::kDouble && nodes > 49152)
+            && mma_max_dim == 5 && mma_tiles[role].defined() && mma_tiles[role].size(0)
+            && (role == 2 ? kernels.size() >= 6 : kernels.size() == 8)
+            && (role != 1 || elements * experts * numel * prototype.element_size() <= (64LL << 20));
+        if (!adaptive_fused && elements == 1 && nodes >= 1024 && !gemm_paths.empty() &&
             !(role == 1 && prototype.scalar_type() == at::kFloat && nodes >= 8192 &&
               experts * numel * prototype.element_size() > (64LL << 20)))
             return shared_gemm(role, original, nodes);
         int chunks = role == 1 ? (nodes + 31) / 32 : 1;
         int64_t chunk_span = 32;
-        const bool tensor_core = elements == 1 && nodes >= 1024
+        const char* indexed_tiles_option = std::getenv("FASTEQ_EXPERIMENTAL_LINEAR_INDEXED_TILES");
+        const bool indexed_tiles = role != 2 && elements > 1 && elements <= 4
+            && prototype.scalar_type() == at::kFloat && indexed_tiles_option
+            && std::strcmp(indexed_tiles_option, "1") == 0;
+        const bool tensor_core = (elements == 1 || indexed_tiles) && nodes >= 1024
             && mma_tiles[role].defined() && mma_tiles[role].size(0)
             && (role == 2 ? kernels.size() >= 6 : kernels.size() == 8)
-            && (role != 1 || experts * numel * prototype.element_size() <= (64LL << 20));
+            && (role != 1 || elements * experts * numel * prototype.element_size() <= (64LL << 20));
         const auto& selected_tiles = tensor_core ? mma_tiles[role] : tiles[role];
         const int64_t chunk_bytes = elements * experts * numel * prototype.element_size();
         // Keep shared/small-element reductions below the scratch budget by
@@ -299,7 +314,7 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
         const int tile_rows = scales.scalar_type() == at::kFloat ? 32 : 64;
         kernels[kernel]->launch(args(inputs, partial.defined() ? partial : result, selected_tiles),
                               tensor_core && role != 1 ? (nodes * mma_max_dim + tile_rows - 1) / tile_rows : role == 1 && !atomic_weights ? chunks : nodes,
-                              role == 1 && !atomic_weights ? count * elements : count,
+                              (role == 1 && !atomic_weights) || (tensor_core && indexed_tiles) ? count * elements : count,
                               128, stream);
         if (partial.defined()) {
             Operands reduction;
@@ -364,6 +379,29 @@ struct LinearPlan : std::enable_shared_from_this<LinearPlan> {
             records.push_back({p[0], p[1], p[2], p[3], p[4], p[5], coefficients[i]});
         }
         gemm_paths = std::move(records);
+        adaptive_o3_c64_h100 = false;
+        static constexpr std::array<std::array<int64_t, 6>, 3> measured_paths{{
+            {{0, 0, 0, 64, 64, 1}},
+            {{64, 4096, 64, 64, 64, 3}},
+            {{256, 8192, 256, 64, 64, 5}}
+        }};
+        if (ir_mul || experts != 1 || din != 576 || dout != 576 || numel != 12288
+            || descriptions.size() != measured_paths.size()) return;
+        for (size_t i = 0; i < measured_paths.size(); ++i) {
+            if (coefficients[i] != 0.125
+                || !std::equal(descriptions[i].begin(), descriptions[i].end(), measured_paths[i].begin()))
+                return;
+        }
+        // These driver property queries run only during plan setup, never inside a timed launch.
+        CUdevice device;
+        int major = 0, minor = 0;
+        char name[256] = {};
+        TORCH_CHECK(cuDeviceGet(&device, paths.get_device()) == CUDA_SUCCESS
+                    && cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) == CUDA_SUCCESS
+                    && cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) == CUDA_SUCCESS
+                    && cuDeviceGetName(name, sizeof(name), device) == CUDA_SUCCESS,
+                    "Unable to identify adaptive Linear device");
+        adaptive_o3_c64_h100 = major == 9 && minor == 0 && std::strstr(name, "H100") != nullptr;
     }
 };
 
@@ -384,6 +422,12 @@ Tensor evaluate(const std::shared_ptr<LinearPlan>& plan, int role, const Tensor&
 } // namespace
 
 void bind_indexed_linear(py::module_& module) {
+    module.def("native_gemm_into", [](Tensor destination, const Tensor& left,
+                                      const Tensor& right, double alpha, double beta) {
+        fasteq_jit::native_gemm_into(destination, left, right, alpha, beta);
+    }, py::arg("destination"), py::arg("left"), py::arg("right"),
+       py::arg("alpha") = 1.0, py::arg("beta") = 0.0,
+       py::call_guard<py::gil_scoped_release>());
     py::class_<LinearPlan, std::shared_ptr<LinearPlan>>(module, "IndexedLinearPlan")
         .def(py::init<std::vector<std::shared_ptr<Kernel>>, Tensor, Tensor,
                       std::vector<Tensor>, std::vector<Tensor>, std::vector<Tensor>,

@@ -9,6 +9,7 @@ and higher derivatives needed for force-loss training.
 
 from ast import literal_eval
 from functools import lru_cache
+from pathlib import Path
 import math
 import os
 
@@ -278,6 +279,57 @@ def _dense_source(dtype, channels=None):
     return source
 
 
+@lru_cache(maxsize=2)
+def _paired_source(dtype):
+    # The loader is the SAME FastEq FCTP padded shared transpose used by the
+    # legacy fctp_fwd/bwd CUDA kernels, rather than another library's template.
+    shared = (Path(__file__).parents[1] / "cuda/src/fctp_shared.cuh").read_text()
+    scalar = "double" if dtype == torch.float64 else "float"
+    return shared + f"""
+    using T={scalar}; using I=long long;
+    extern "C" __global__ void paired_scatter(const T* matrix,const T* x,const T* y,
+      T* dx,T* dy,I start,I n,int dinx,int diny,int xb,int xs,int yb,int ys,
+      int c1,int c2,int doutx,int douty,T coefficient) {{
+      I row=blockIdx.x;
+      if(row>=n) return;
+      int tid=threadIdx.x,pitch=c1+1;
+      I e=start+row;
+      extern __shared__ unsigned char raw[];
+      T* transposed=reinterpret_cast<T*>(raw);
+      T* sx=transposed+c2*pitch;
+      T* sy=sx+c1;
+      const T* source=matrix+row*(I)c1*c2;
+      // A padded shared transpose makes both contractions coalesced without
+      // loading the same matrix twice from global memory. Reuse the original
+      // FCTP vector loader when every source row has the required alignment.
+      constexpr unsigned alignment={32 if dtype == torch.float64 else 16};
+      if(c2%4==0 && (reinterpret_cast<unsigned long long>(source)%alignment)==0) {{
+        int vectors=c1*(c2/4);
+        for(int i=tid;i<vectors;i+=blockDim.x) {{
+          int u=i/(c2/4),v=(i%(c2/4))*4;
+          fasteq_fctp::transpose_four(transposed,pitch,v,u,source+u*c2+v);
+        }}
+      }} else {{
+        for(int i=tid;i<c1*c2;i+=blockDim.x)
+          transposed[(i%c2)*pitch+i/c2]=source[i];
+      }}
+      for(int u=tid;u<c1;u+=blockDim.x) sx[u]=x[e*dinx+xb+u*xs];
+      for(int v=tid;v<c2;v+=blockDim.x) sy[v]=y[e*diny+yb+v*ys];
+      __syncthreads();
+      for(int u=tid;u<c1;u+=blockDim.x) {{
+        T total=0;
+        for(int v=0;v<c2;++v) total+=transposed[v*pitch+u]*sy[v];
+        dx[e*doutx+xb+u*xs]+=coefficient*total;
+      }}
+      for(int v=tid;v<c2;v+=blockDim.x) {{
+        T total=0;
+        for(int u=0;u<c1;++u) total+=transposed[v*pitch+u]*sx[u];
+        dy[e*douty+yb+v*ys]+=coefficient*total;
+      }}
+    }}
+    """
+
+
 @lru_cache(maxsize=256)
 def _dense_plan(metadata, dtype, device):
     from fasteq.cuda.jit import kernels, runtime
@@ -309,14 +361,65 @@ def _dense_plan(metadata, dtype, device):
     pack = kernels([source], device, entry="pack")[source]
     scatter = kernels([source], device, entry="scatter")[source]
     outer = kernels([source], device, entry="angular_outer")[source]
+    pair_source = _paired_source(dtype)
+    paired = kernels([pair_source], device, entry="paired_scatter")[pair_source]
     _, dense_tables, dense_scales = _tables(repr((dimensions, dense, scales)), dtype, device)
     plan = runtime().SegmentedProductPlan(dimensions, dense, scales, pack, scatter,
-                                         outer, dense_tables, dense_scales)
+                                         outer, paired, dense_tables, dense_scales,
+                                         os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_NATIVE_FUSION") == "1")
     rest = repr((dimensions, tuple(residual), tuple(residual_scales))) if residual else None
     return plan, rest
 
 
+@lru_cache(maxsize=256)
+def _fctp_scalar64_coefficient(metadata):
+    """Identify the continuous-Y extension of the original scalar FCTP."""
+    dimensions, terms, coefficients = _parse(metadata)
+    if (tuple(dimensions) == (64 ** 3, 64, 64, 64) and len(terms) == 1
+            and tuple(terms[0]) == (3, 0, 0, 1, 0, 1, 0, 1, 64, 64, 64, 1)
+            and len(coefficients) == 1 and math.isfinite(coefficients[0])):
+        return coefficients[0]
+    return None
+
+
+def _fctp_scalar64_eligible(metadata, role, rows, values):
+    if os.environ.get("FASTEQ_EXPERIMENTAL_FCTP_FUSED") != "1" or not rows:
+        return False
+    x = values[1]
+    return (x.is_cuda and x.dtype in (torch.float32, torch.float64)
+            and _fctp_scalar64_coefficient(metadata) is not None
+            and values[0].shape[0] == 1
+            and all(values[r].shape[0] == rows for r in (1, 2, 3) if r != role)
+            and (role == 0 or values[role].shape[0] in (0, rows)))
+
+
+def _fctp_scalar64_execute(metadata, role, rows, values):
+    from fasteq.cuda.jit import runtime
+
+    x = values[1]
+    if any(v.device != x.device or v.dtype != x.dtype for v in values):
+        raise ValueError("Segmented product operands must share device and dtype")
+    w, x, y, z = [v.contiguous() for v in values]
+    coefficient = _fctp_scalar64_coefficient(metadata)
+    compiler = runtime()
+    if role == 3:
+        output = x.new_empty(rows, 64)
+        compiler.fctp_forward_into(output, x, y, w.view(4096, 64), coefficient)
+    elif role == 0:
+        output = x.new_empty(1, 64 ** 3)
+        compiler.fctp_weight_into(output.view(4096, 64), x, y, z, coefficient)
+    else:
+        output = x.new_empty(rows, 64)
+        unused = x.new_empty(0)
+        compiler.fctp_features_into(output if role == 1 else unused,
+                                   output if role == 2 else unused,
+                                   w, x, y, z, coefficient, 1 << (role - 1))
+    return output
+
+
 def _execute(metadata, role, required, rows, values):
+    if _fctp_scalar64_eligible(metadata, role, rows, values):
+        return _fctp_scalar64_execute(metadata, role, rows, values)
     if os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_GEMM") == "1":
         x = values[1]
         if x.is_cuda and x.dtype in (torch.float32, torch.float64):
@@ -416,6 +519,13 @@ class _FeaturePair(torch.autograd.Function):
         ctx.save_for_backward(*values)
         ctx.set_materialize_grads(False)
         x = values[1]
+        if _fctp_scalar64_eligible(metadata, 0, rows, values):
+            from fasteq.cuda.jit import runtime
+            w, x, y, z = [v.contiguous() for v in values]
+            dx, dy = x.new_empty(rows, 64), x.new_empty(rows, 64)
+            runtime().fctp_features_into(dx, dy, w, x, y, z,
+                                        _fctp_scalar64_coefficient(metadata), 3)
+            return dx, dy
         plan, residual = _dense_plan(metadata, x.dtype, x.device)
         values = [v.contiguous() for v in values]
         seedx = (_execute_cuda(residual, 1, required, rows, values)
@@ -439,7 +549,10 @@ class _FeaturePair(torch.autograd.Function):
         def add(a, b):
             if a is None:
                 return b
-            return a if b is None else a + b
+            if b is None:
+                return a
+            from .native_bias import native_add
+            return native_add(a, b)
 
         dw = None
         if requested[0]:
@@ -480,8 +593,11 @@ class _Product(torch.autograd.Function):
                 and os.environ.get("FASTEQ_EXPERIMENTAL_SEGMENTED_PAIR") == "1"
                 and values[0].shape[0] == 1 and ctx.rows
                 and all(values[r].shape[0] == ctx.rows for r in (1, 2, 3))):
-            plan, _ = _dense_plan(ctx.kernel_metadata, values[1].dtype, values[1].device)
-            if plan is not None:
+            eligible = _fctp_scalar64_eligible(ctx.kernel_metadata, 0, ctx.rows, values)
+            if not eligible:
+                plan, _ = _dense_plan(ctx.kernel_metadata, values[1].dtype, values[1].device)
+                eligible = plan is not None
+            if eligible:
                 feature_pair = _FeaturePair.apply(ctx.kernel_metadata,
                                                  ctx.required | (1 << ctx.role),
                                                  ctx.rows, *values)

@@ -7,7 +7,7 @@ import triton
 from torch.autograd.function import once_differentiable
 from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
-from ..cuda.triton_launch import launch_triton
+from .native_gate_norm import launch as launch_native
 from ..triton import gate_norm as kernels
 from .equivariant_norm import (
     NormPlan,
@@ -214,7 +214,7 @@ class _GateNormBackward(torch.autograd.Function):
 class GateNormPlan:
     """Noncentering Prophet RMS after Gate; parameters remain owned by the norm."""
 
-    backend = "FastEq Triton fused residual/Gate/RMS (first and second gradients)"
+    backend = "FastEq native CUDA fused residual/Gate/RMS (first and second gradients)"
 
     @staticmethod
     def supports(norm):
@@ -269,12 +269,12 @@ class GateNormPlan:
         }
 
     def launch(self, fn, arguments, x, **extra):
-        """Reuse the compiled FastEq Triton cubin with a resident CUDA launcher."""
+        """Reuse FastEq Gate/Norm native primitives in one fused row kernel."""
         kwargs = self.kwargs(x)
         if fn is kernels.backward_direct or fn is kernels.double_backward_direct:
             kwargs["num_warps"] = 16
         kwargs.update(extra)
-        launch_triton(fn, arguments, x, kwargs, self._launchers)
+        launch_native(self, fn, arguments, x, kwargs)
 
     def rematerialize_adjoints(self, x):
         """Avoid large FP64 cross-warp gathers; short rows keep fused gathers."""

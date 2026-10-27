@@ -211,13 +211,9 @@ def _partial_layout(widths, requested):
 
 
 def _parameter_gradients(partials, parameters, requested, widths, width):
-    if not width:
-        return [None] * len(parameters)
-    combined = _reduce_rows(partials, width,
-                            'fp64' if partials.dtype == torch.float64 else 'fp32')
-    pieces = iter(combined.split(widths))
-    return [next(pieces).reshape(parameter.shape) if needed else None
-            for parameter, needed in zip(parameters, requested, strict=True)]
+    from .native_equivariant_norm import parameter_gradients
+
+    return parameter_gradients(partials, parameters, requested, widths, width)
 
 
 class _Norm(torch.autograd.Function):
@@ -313,7 +309,7 @@ def _entry(container, index):
 class NormPlan:
     """Original TACE/Prophet normalization with live source parameters."""
 
-    backend = "FastEq Triton Norm (d37eaca moment/reduction, FP64/ragged/double extension)"
+    backend = "FastEq native CUDA Norm (source moment/centering/affine/full double gradients)"
 
     def __init__(self, module, tace=False):
         self.tace = tace
@@ -357,7 +353,9 @@ class NormPlan:
         return state
 
     def launch(self, fn, arguments, x, kwargs):
-        launch_triton(fn, arguments, x, kwargs, self._launchers)
+        from .native_equivariant_norm import launch
+
+        launch(self, fn, arguments, x, kwargs)
 
     def kwargs(self, x):
         return {"D": self.dim, "BLOCK": triton.next_power_of_2(self.dim), "PARTS": self.parts,

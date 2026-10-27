@@ -4272,6 +4272,24 @@ def _bwd_label_index_expr(
     raise ValueError(f"Bad backward label kind: {kind}")
 
 
+def _warp_reduce_atomic_lines(target: str, value: str) -> List[str]:
+    """One atomic per 32-channel tile, including a partial final tile."""
+    return [
+        "            {", f"                scalar_t sum = {value};",
+        "#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)",
+        "                for (int offset=16; offset>0; offset/=2) {",
+        "                    scalar_t other = __shfl_down(sum, offset, 32);",
+        "                    if (lane + offset < 32 && u + offset < U) sum += other;",
+        "                }", "#else",
+        "                const unsigned mask = __activemask();",
+        "                for (int offset=16; offset>0; offset/=2) {",
+        "                    scalar_t other = __shfl_down_sync(mask, sum, offset);",
+        "                    if (lane + offset < 32 && u + offset < U) sum += other;",
+        "                }", "#endif",
+        f"                if (lane == 0) atomicAdd(&{target}, sum);", "            }",
+    ]
+
+
 def emit_fused_bwd_kernel_from_lars_schedule(
     schedule_result: ScheduleResult,
     *,
@@ -4302,6 +4320,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         raise ValueError(f"Unsupported mode: {mode}")
 
     mode_scalar_y = mode == "u,u,,u"
+    warp_reduce = os.environ.get("FASTEQ_EXPERIMENTAL_U1D_SCALAR_REDUCE") == "1"
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
 
@@ -4396,6 +4415,13 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     def ap(line: str = ""):
         lines.append(line)
 
+    def emit_scalar_y_writeback(expr: str, value: str) -> None:
+        if warp_reduce and mode_scalar_y:
+            for line in _warp_reduce_atomic_lines(f"grad_y[{expr}]", value):
+                ap(line)
+        else:
+            ap(f"            atomicAdd(&grad_y[{expr}], {value});")
+
     def shared_expr(token: str) -> str:
         if not isinstance(token, str) or not token.startswith("s"):
             raise ValueError(f"Bad shared token: {token!r}")
@@ -4450,11 +4476,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         elif kind == "gx":
             ap(f"            atomicAdd(&grad_x[{expr}], {value_expr});")
         elif kind == "gy":
-            # Portable correctness path for scalar-y and vector-y:
-            # each valid u lane contributes directly.  This deliberately avoids
-            # warp/wavefront shuffle semantics (CUDA warp32 vs HIP wave32/wave64)
-            # and is also correct for a partial final 32-lane tile.
-            ap(f"            atomicAdd(&grad_y[{expr}], {value_expr});")
+            # Scalar-Y optionally combines each logical 32-lane channel tile;
+            # vector-Y keeps independent channel writes.
+            emit_scalar_y_writeback(expr, value_expr)
         else:
             raise ValueError(f"Bad backward accumulator kind: {kind}")
 
@@ -4487,8 +4511,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("")
     ap("using GPU_Guard = c10::DeviceGuard;")
     ap("")
-    ap("// grad_y scalar reduction intentionally uses per-lane atomicAdd.")
-    ap("// No warp/wavefront shuffle is used, so CUDA and HIP share one path.")
+    ap("// Scalar-Y can combine channel contributions before its atomic writeback.")
     ap("")
 
     ap("template <typename scalar_t, typename index_t>")
@@ -4696,9 +4719,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             elif kind == "gx":
                 ap(f"            atomicAdd(&grad_x[{expr}], {reg});")
             elif kind == "gy":
-                # One atomic contribution per valid u lane.  Do not reduce with
-                # hardware warp/wavefront shuffle here.
-                ap(f"            atomicAdd(&grad_y[{expr}], {reg});")
+                # The shared epilogue also handles partial channel tiles.
+                emit_scalar_y_writeback(expr, reg)
             else:
                 raise ValueError("store_acc expects a backward output label")
 
@@ -4744,8 +4766,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             ky_dim=ky_dim,
             v_dim=v_dim,
         )
-        # Portable per-lane accumulation; valid for both scalar-y and vector-y.
-        ap(f"            atomicAdd(&grad_y[{expr}], gy_acc_k_{gy_idx});")
+        # Share the same scalar/vector epilogue with scheduled writeback.
+        emit_scalar_y_writeback(expr, f"gy_acc_k_{gy_idx}")
 
     ap("        }")
     ap("    }")
@@ -6510,6 +6532,7 @@ class U1DDoubleBwdPath:
     v: int
     c: float
     need_grad_w: bool = True
+    output_kind: Optional[str] = None
 
     @property
     def labels(self) -> Tuple[Label, ...]:
@@ -6525,15 +6548,27 @@ class U1DDoubleBwdPath:
             ("ggx", self.j),
             ("ggy", self.k),
         ])
+        if self.output_kind is not None:
+            # Split derivatives reuse the existing LARS scheduler and retain
+            # one output family. Its accumulator lives until its last path.
+            dependencies = {
+                "dgo": {"w", "x", "y", "ggw", "ggx", "ggy"},
+                "dw": {"go", "x", "y", "ggx", "ggy"},
+                "dx": {"go", "w", "y", "ggw", "ggy"},
+                "dy": {"go", "w", "x", "ggw", "ggx"},
+            }
+            labs = [lab for lab in labs if lab[0] in dependencies[self.output_kind]]
+            index = {"dgo": self.v, "dw": self.i, "dx": self.j, "dy": self.k}
+            labs.append((self.output_kind, index[self.output_kind]))
         return tuple(labs)
 
 
 class LARSUniform1DDoubleBwdScheduler(LARSUniform1DScheduler):
     """LARS scheduler for the fully-unrolled Uniform1D double backward.
 
-    Only read-only operands participate in the LARS live set.  The four output
-    gradients are emitted as atomic accumulations, which is required for all
-    supported layouts (source indirection, scatter, WB==1, and scalar-y).
+    The fused variant schedules read-only operands and writes path atomics.
+    A split variant schedules one output family together with its operands,
+    reusing STC's accumulator lifetime scheme to combine paths before writing.
     """
 
     def __init__(
@@ -6541,6 +6576,7 @@ class LARSUniform1DDoubleBwdScheduler(LARSUniform1DScheduler):
         paths: Iterable[Tuple[int, int, int, int, float]],
         *,
         need_grad_w: bool = True,
+        output_kind: Optional[str] = None,
         enable_secondary_affinity: bool = True,
         topk_candidates: Optional[int] = None,
         debug: bool = False,
@@ -6552,10 +6588,11 @@ class LARSUniform1DDoubleBwdScheduler(LARSUniform1DScheduler):
     ):
         self.path_kind = "u1d_double_bwd"
         self.need_grad_w = bool(need_grad_w)
+        self.output_kind = output_kind
         self.paths: List[U1DDoubleBwdPath] = [
             U1DDoubleBwdPath(
                 pid=p, i=i, j=j, k=k, v=v, c=c,
-                need_grad_w=self.need_grad_w,
+                need_grad_w=self.need_grad_w, output_kind=output_kind,
             )
             for p, (i, j, k, v, c) in enumerate(paths)
         ]
@@ -6623,16 +6660,28 @@ class LARSUniform1DDoubleBwdScheduler(LARSUniform1DScheduler):
         }
         return f"{names.get(kind, kind)}[{idx}]"
 
+    def _emit_load_inst(self, lab: Label, reg: str, reason: str) -> None:
+        if lab[0] == self.output_kind:
+            self.instructions.append(Inst("init_acc", (reg, self._label_name(lab)), reason))
+        else:
+            super()._emit_load_inst(lab, reg, reason)
+
+    def _store_and_release(self, lab: Label, reason: str = "") -> None:
+        if lab in self.live and lab[0] == self.output_kind:
+            # Same lifetime/writeback scheme as FastEq's STC double backward.
+            self.instructions.append(Inst("store_acc", (self._label_name(lab), self.reg_of[lab]), reason))
+        super()._store_and_release(lab, reason)
+
     def _emit_path_compute(self, pid: int) -> None:
         p = self._path(pid)
         reg = self.reg_of
-        rw = reg[("w", p.i)]
-        rx = reg[("x", p.j)]
-        ry = reg[("y", p.k)]
-        rgo = reg[("go", p.v)]
-        rggw = reg[("ggw", p.i)] if self.need_grad_w else ""
-        rggx = reg[("ggx", p.j)]
-        rggy = reg[("ggy", p.k)]
+        rw = reg.get(("w", p.i), "unused")
+        rx = reg.get(("x", p.j), "unused")
+        ry = reg.get(("y", p.k), "unused")
+        rgo = reg.get(("go", p.v), "unused")
+        rggw = reg.get(("ggw", p.i), "unused") if self.need_grad_w else ""
+        rggx = reg.get(("ggx", p.j), "unused")
+        rggy = reg.get(("ggy", p.k), "unused")
 
         self.instructions.append(Inst(
             "double_bwd_fma_resident",
@@ -6640,6 +6689,7 @@ class LARSUniform1DDoubleBwdScheduler(LARSUniform1DScheduler):
                 p.i, p.j, p.k, p.v,
                 rw, rx, ry, rgo, rggw, rggx, rggy,
                 p.c, self.need_grad_w,
+                reg.get((self.output_kind, {"dgo": p.v, "dw": p.i, "dx": p.j, "dy": p.k}.get(self.output_kind)), ""),
             ),
             (
                 f"path#{pid}: double backward; "
@@ -6688,6 +6738,7 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
+    output_kind: Optional[str] = None,
 ) -> str:
     """Emit a fully-unrolled fused double-backward kernel from a LARS schedule."""
     block_size = int(block_size)
@@ -6840,7 +6891,7 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
             kind, idx = parse_ref(str(ref))
             ap(f"            {reg} = {input_expr(kind, idx)};")
         elif inst.op == "double_bwd_fma_resident":
-            wi, xj, yk, ov, rw, rx, ry, rgo, rggw, rggx, rggy, coeff, inst_need_gw = inst.args
+            wi, xj, yk, ov, rw, rx, ry, rgo, rggw, rggx, rggy, coeff, inst_need_gw = inst.args[:13]
             c = _fmt_lars_float(float(coeff))
             t_dgo: List[str] = []
             if bool(inst_need_gw):
@@ -6855,10 +6906,33 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
             if bool(inst_need_gw):
                 t_dy.append(f"({rggw} * {rgo} * {rx})")
             t_dy.append(f"({rggx} * {rgo} * {rw})")
-            ap(f"            atomicAdd(&d_grad_out[{output_index('dgo', int(ov))}], scalar_t({c}) * ({' + '.join(t_dgo)}));")
-            ap(f"            atomicAdd(&d_w[{output_index('dw', int(wi))}], scalar_t({c}) * ({' + '.join(t_dw)}));")
-            ap(f"            atomicAdd(&d_x[{output_index('dx', int(xj))}], scalar_t({c}) * ({' + '.join(t_dx)}));")
-            ap(f"            atomicAdd(&d_y[{output_index('dy', int(yk))}], scalar_t({c}) * ({' + '.join(t_dy)}));")
+            contributions = {"dgo": ("d_grad_out", ov, t_dgo), "dw": ("d_w", wi, t_dw),
+                             "dx": ("d_x", xj, t_dx), "dy": ("d_y", yk, t_dy)}
+            for kind, (destination, index, terms) in contributions.items():
+                value = f"scalar_t({c}) * ({' + '.join(terms)})"
+                if output_kind is None:
+                    ap(f"            atomicAdd(&{destination}[{output_index(kind, int(index))}], {value});")
+                elif kind == output_kind:
+                    ap(f"            {inst.args[13]} += {value};")
+        elif inst.op == "init_acc":
+            ap(f"            {inst.args[0]} = scalar_t(0);")
+        elif inst.op == "store_acc":
+            ref, reg = inst.args
+            kind, index = parse_ref(str(ref))
+            destination = {"dgo": "d_grad_out", "dw": "d_w", "dx": "d_x", "dy": "d_y"}[kind]
+            target = f"{destination}[{output_index(kind, index)}]"
+            if kind == "dy" and mode_scalar_y:
+                # Scalar-Y reduction reuses FastEq's existing warp-shuffle
+                # strategy. Handle partial channel warps without invalid reads.
+                for line in _warp_reduce_atomic_lines(target, reg):
+                    ap(line)
+            elif kind == "dw":
+                ap(f"            if (WB == 1) atomicAdd(&{target}, {reg}); else {target} = {reg};")
+            elif ((kind == "dgo" and use_scatter) or (kind == "dx" and use_x_src)
+                  or (kind == "dy" and use_y_src)):
+                ap(f"            atomicAdd(&{target}, {reg});")
+            else:
+                ap(f"            {target} = {reg};")
         elif inst.op == "release":
             pass
         else:
@@ -6923,6 +6997,7 @@ def emit_uniform1d_double_bwd_launcher(
     use_x_src: bool,
     use_y_src: bool,
     use_scatter: bool,
+    kernel_names: Optional[Sequence[str]] = None,
 ) -> str:
     params = [
         "    torch::Tensor w",
@@ -6974,7 +7049,7 @@ def emit_uniform1d_double_bwd_launcher(
     dst_arg = "(const int32_t*)dst_idx.data_ptr<int32_t>()" if use_scatter else "nullptr"
     ggw_launch_decl = "        (const scalar_t*)grad_grad_w.data_ptr<scalar_t>(),\n" if need_grad_w else ""
 
-    return f'''
+    code = f'''
 
 torch::Tensor launcher_dummy_{bundle_name}();
 
@@ -7031,6 +7106,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("run", &launcher_{bundle_name}, "{bundle_name} Uniform1D double backward LARS jit impl");
 }}
 '''
+    if kernel_names:
+        start = code.index(f"        launch_{bundle_name}<scalar_t>(")
+        end = code.index("U, stream);", start) + len("U, stream);")
+        call = code[start:end]
+        code = code[:start] + "\n".join(call.replace(f"launch_{bundle_name}<", f"launch_{name}<")
+                                       for name in kernel_names) + code[end:]
+    return code
+
 
 
 def generate_code_uniform1d_double_bwd_with_scheduler(
@@ -7059,6 +7142,7 @@ def generate_code_uniform1d_double_bwd_with_scheduler(
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
     block_size: int = 32,
+    split_outputs: bool = False,
 ) -> Any:
     """Generate the fused fully-unrolled LARS Uniform1D double backward."""
     ctx = _prepare_uniform1d_bwd_codegen_context(
@@ -7067,6 +7151,33 @@ def generate_code_uniform1d_double_bwd_with_scheduler(
         output_indices=output_indices, mode=mode,
         path_semantics=path_semantics,
     )
+    if split_outputs:
+        codes, names, schedules = [], [], {}
+        for kind in ("dgo", "dw", "dx", "dy"):
+            scheduler = LARSUniform1DDoubleBwdScheduler(
+                ctx.bwd_paths, need_grad_w=bool(need_grad_w), output_kind=kind,
+                enable_secondary_affinity=enable_secondary_affinity,
+                topk_candidates=topk_candidates, profile=profile,
+                profile_name=f"lars_double_bwd_{kind}", profile_print=profile_print)
+            schedule = scheduler.schedule()
+            name = f"{kernel_name}_splitacc_{kind}"
+            names.append(name); schedules[kind] = schedule
+            codes.append(emit_uniform1d_double_bwd_kernel_from_lars_schedule(
+                schedule, kernel_name=name, mode=mode, need_grad_w=bool(need_grad_w),
+                use_x_src=ctx.use_x_src, use_y_src=ctx.use_y_src, use_scatter=ctx.use_scatter,
+                u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
+                block_size=int(block_size), output_kind=kind))
+        bundle = f"{kernel_name}_splitacc"
+        codes.append(emit_uniform1d_double_bwd_launcher(
+            bundle, mode, need_grad_w=bool(need_grad_w), use_x_src=ctx.use_x_src,
+            use_y_src=ctx.use_y_src, use_scatter=ctx.use_scatter, kernel_names=names))
+        code = "\n".join(codes)
+        if out_path:
+            Path(out_path).write_text(code, encoding="utf-8")
+        if return_schedule:
+            return {"name": "lars_splitacc", "code": code, "kernel_name": bundle,
+                    "schedules": schedules}
+        return code
     cand_name = "lars_double_bwd_all_inputs"
     scheduler = LARSUniform1DDoubleBwdScheduler(
         paths=ctx.bwd_paths,

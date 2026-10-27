@@ -219,10 +219,7 @@ def _source(metadata, dtype, strategy="direct", block=128):
     return "\n".join([*code, "}"])
 
 
-@torch.library.custom_op(
-    "fasteq::scalar_expression", mutates_args=(), device_types="cuda"
-)
-def scalar_expression(metadata: str, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+def _execute_raw(metadata: str, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
     _, outputs, widths = _parse(metadata)
     if (
         not inputs
@@ -256,6 +253,14 @@ def scalar_expression(metadata: str, inputs: list[torch.Tensor]) -> list[torch.T
             torch.cuda.current_stream(values[0].device).cuda_stream,
         )
     return results
+
+
+@torch.library.custom_op(
+    "fasteq::scalar_expression", mutates_args=(), device_types="cuda"
+)
+def scalar_expression(metadata: str, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Keep the existing Wigner/custom-op API over the shared CUDA launcher."""
+    return _execute_raw(metadata, inputs)
 
 
 @scalar_expression.register_fake

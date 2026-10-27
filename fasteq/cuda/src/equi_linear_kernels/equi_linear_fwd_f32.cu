@@ -15,9 +15,21 @@
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
+// Optional native mul_ir access for the existing WGMMA pipeline. These paths
+// have one input/output irrep each; the general packed API remains unchanged.
+struct LinearNativePath { int sx, sw, sy, ci, dim; };
+struct LinearNativeAccess {
+    const float *x = nullptr, *w = nullptr;
+    float *y = nullptr;
+    const int64_t *ids = nullptr;
+    int din = 0, dout = 0;
+    LinearNativePath paths[16]{};
+};
+
 /* ===================== Device Helper Functions ===================== */
 __device__ __forceinline__ void wg_trans_16x32f32tf32_sw128B_sync(
-    float *out_smem_ptr,            // out buffer ptr to store output 32*32 data
+    float *out_smem_ptr,            // TF32 high tile
+    float *low_smem_ptr,            // TF32 residual tile
     float *tmp_smem_ptr,            // tmp buffer ptr containning input 16x32 data
     const float &cur_cg_val,        // cur_cg_val
     const uint32_t &base_sw_x0_tag, // 0 or 1 (indicate swizzle 16B_x starts from 0 or 4)
@@ -29,7 +41,7 @@ __device__ __forceinline__ void wg_trans_16x32f32tf32_sw128B_sync(
     // and then make 128B swizzle with a neighbor 32x16 matirx (i.e. 32x32 matirx sw128B)
     uint32_t ld_col = in_wg_tid % 32;
     uint32_t ld_row0 = (in_wg_tid / 32) * 4;
-    float tmp_reg[4];
+    float tmp_reg[4], low_reg[4];
 #pragma unroll
     for (uint32_t cnt = 0; cnt < 4; ++cnt)
     {
@@ -38,6 +50,8 @@ __device__ __forceinline__ void wg_trans_16x32f32tf32_sw128B_sync(
         uint32_t tf32_data;
         asm_cvt_tf32_f32(tf32_data, fp32_data);
         tmp_reg[cnt] = __uint_as_float(tf32_data);
+        asm_cvt_tf32_f32(tf32_data, fp32_data - tmp_reg[cnt]);
+        low_reg[cnt] = __uint_as_float(tf32_data);
     }
 
     // store to out smem sync
@@ -45,6 +59,7 @@ __device__ __forceinline__ void wg_trans_16x32f32tf32_sw128B_sync(
     uint32_t st_unsw_16B_x = base_sw_x0_tag * 4 + (in_wg_tid / 32); // 0~7
     uint32_t st_sw_x = ((st_sw_y % 8) ^ st_unsw_16B_x) * 4;
     FETCH_16B(out_smem_ptr[st_sw_y * 32 + st_sw_x]) = FETCH_16B(tmp_reg[0]);
+    FETCH_16B(low_smem_ptr[st_sw_y * 32 + st_sw_x]) = FETCH_16B(low_reg[0]);
 }
 
 __device__ __forceinline__ void warp_ldmatirx_8x32f32_sw128B_sync(
@@ -245,6 +260,9 @@ __device__ void preloop_producer(barrier bars_ready[],         // buffer finish 
             bars_ready[(cur_buffer_id + i) % TOTAL_STAGES].arrive_and_wait();
         }
     }
+    // All warp groups must finish this phase before reused barriers/buffers
+    // can be initialized for the next one. Arrive alone does not wait.
+    __syncthreads();
 }
 
 template <uint32_t TILE_N, uint32_t TILE_K, uint32_t B_SMEM_SIZE_PER_TILE, uint32_t CONSUMER_WG_NUM,
@@ -277,7 +295,8 @@ __device__ void preloop_consumer(barrier bars_ready[],           // buffer finis
         // consume (TILE_N = 32)
         uint32_t base_sw_x0_tag = consumer_wg_id;
         wg_trans_16x32f32tf32_sw128B_sync(
-            (B_smem + k_count * B_SMEM_SIZE_PER_TILE), // out buffer ptr to store output 32*32 data
+            (B_smem + k_count * B_SMEM_SIZE_PER_TILE), // TF32 high
+            (B_smem + U * TILE_N + k_count * B_SMEM_SIZE_PER_TILE), // residual
             (tmp_smem + cur_buffer_id * PRELOOP_BUFFER_SIZE_PER_STAGE +
              base_sw_x0_tag * 512), // tmp buffer ptr containning input 16x32 data
             cur_cg_val,             // cur_cg_val
@@ -289,6 +308,9 @@ __device__ void preloop_consumer(barrier bars_ready[],           // buffer finis
         // switch to next buffer
         cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
     }
+    // All warp groups must finish this phase before reused barriers/buffers
+    // can be initialized for the next one. Arrive alone does not wait.
+    __syncthreads();
 }
 
 template <uint32_t TILE_M, uint32_t TILE_K, uint32_t A_SMEM_SIZE_PER_STAGE, uint32_t TOTAL_STAGES>
@@ -356,6 +378,86 @@ __device__ void mainloop_producer(barrier bars_ready[],       // buffer finish c
             bars_ready[(cur_buffer_id + i) % TOTAL_STAGES].arrive_and_wait();
         }
     }
+    // All warp groups must finish this phase before reused barriers/buffers
+    // can be initialized for the next one. Arrive alone does not wait.
+    __syncthreads();
+}
+
+// All producer lanes gather directly into the same shared tiles used by the
+// original consumers. No global packed input or padded weight is materialized.
+// Barrier 3 belongs exclusively to the 128-lane producer warpgroup.
+template <bool WEIGHT, uint32_t TILE_M, uint32_t TILE_N, uint32_t TILE_K,
+          uint32_t TOTAL_STAGES>
+__device__ void native_linear_producer(barrier bars_ready[], barrier bars_filled[],
+    float *buffer, const LinearNativeAccess &access, const LinearNativePath &p,
+    uint32_t angle, uint32_t mtile, uint32_t ntile, uint32_t nodes,
+    uint32_t u, uint32_t v, uint32_t lane, const int64_t *row_ids) {
+    constexpr uint32_t SIZE = WEIGHT ? TILE_K * TILE_N : TILE_M * TILE_K;
+    uint32_t stage = 0;
+    for (uint32_t k = 0; k < u; k += TILE_K) {
+        if (lane == 0) bars_ready[stage].arrive_and_wait();
+        asm volatile("bar.sync 3, 128;" : : : "memory");
+        #pragma unroll 4
+        for (uint32_t i = lane; i < SIZE; i += 128) {
+            const float *source = access.x;
+            uint32_t offset, valid = 0;
+            if constexpr (WEIGHT) {
+                const uint32_t ci = k + i / TILE_N, co = ntile * TILE_N + i % TILE_N;
+                source = access.w;
+                if (ci < p.ci && co < v) {
+                    source += p.sw + uint64_t(ci) * v + co;
+                    valid = 4;
+                }
+                offset = i;
+            } else {
+                const uint32_t row = i / TILE_K, col = i % TILE_K;
+                const uint32_t n = mtile * TILE_M + row, ci = k + col;
+                if (n < nodes && ci < p.ci) {
+                    const int64_t original = row_ids[row];
+                    source += original * access.din + p.sx + ci * p.dim + angle;
+                    valid = 4;
+                }
+                offset = row * TILE_K + (((col / 4) ^ (row % 8)) * 4 + col % 4);
+            }
+            const uint32_t destination = static_cast<uint32_t>(__cvta_generic_to_shared(buffer + stage * SIZE + offset));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::
+                "r"(destination), "l"(source), "r"(valid) : "memory");
+        }
+        asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+        asm volatile("bar.sync 3, 128;" : : : "memory");
+        if (lane == 0) bars_filled[stage].arrive();
+        stage = (stage + 1) % TOTAL_STAGES;
+    }
+    if (lane == 0)
+        for (uint32_t i = 0; i < TOTAL_STAGES; ++i)
+            bars_ready[(stage + i) % TOTAL_STAGES].arrive_and_wait();
+    __syncthreads();
+}
+
+// Reuse the existing conflict-free register/shared transpose, then scatter full
+// channel rows. Each warp writes one node, reducing fragmented transactions.
+template <uint32_t TILE_M, uint32_t TILE_N, uint32_t CONSUMER_WG_NUM>
+__device__ void native_linear_store(float *output_smem,
+    float accu[(TILE_M / CONSUMER_WG_NUM) / 64][TILE_N / 8][4],
+    const LinearNativeAccess &access, const LinearNativePath &p,
+    uint32_t angle, uint32_t mtile, uint32_t ntile, uint32_t nodes,
+    uint32_t consumer, uint32_t lane, const int64_t *row_ids) {
+    constexpr uint32_t ROWS = TILE_M / CONSUMER_WG_NUM;
+    float *tile = output_smem + consumer * ROWS * TILE_N;
+    for (uint32_t m = 0; m < ROWS / 64; ++m) {
+        wg_reg_swap_swizzle4_m64n32f32<TILE_N>(accu[m], lane);
+        wg_R2S_swizzle4_m64n32f32<TILE_N>(tile + m * 64 * TILE_N, accu[m], lane);
+    }
+    if (consumer == 0) asm volatile("bar.sync 1, 128;" ::: "memory");
+    else asm volatile("bar.sync 2, 128;" ::: "memory");
+    for (uint32_t i = lane; i < ROWS * TILE_N; i += 128) {
+        const uint32_t n = mtile * TILE_M + consumer * ROWS + i / TILE_N;
+        if (n < nodes) {
+            const int64_t original = row_ids[consumer * ROWS + i / TILE_N];
+            const uint32_t col = ntile * TILE_N + i % TILE_N;
+            access.y[original * access.dout + p.sy + col * p.dim + angle] = tile[i];
+        }
+    }
 }
 
 template <uint32_t TILE_M, uint32_t TILE_N, uint32_t TILE_K, uint32_t A_SMEM_SIZE_PER_STAGE,
@@ -390,6 +492,7 @@ __device__ void mainloop_consumer(barrier bars_ready[],  // buffer finish consum
 
         // load A data from SMEM
         float a_reg[(TILE_M / CONSUMER_WG_NUM) / 64][16];
+        float a_low[(TILE_M / CONSUMER_WG_NUM) / 64][16];
 #pragma unroll
         for (uint32_t _m = 0; _m < ((TILE_M / CONSUMER_WG_NUM) / 64); ++_m)
         {
@@ -404,7 +507,10 @@ __device__ void mainloop_consumer(barrier bars_ready[],  // buffer finish consum
             {
                 uint32_t tmp;
                 asm_cvt_tf32_f32(tmp, a_reg[_m][_l]);
+                const float value = a_reg[_m][_l];
                 a_reg[_m][_l] = __uint_as_float(tmp);
+                asm_cvt_tf32_f32(tmp, value - a_reg[_m][_l]);
+                a_low[_m][_l] = __uint_as_float(tmp);
             }
         }
 
@@ -419,6 +525,13 @@ __device__ void mainloop_consumer(barrier bars_ready[],  // buffer finish consum
                 uint64_t b_desc = make_smem_desc(&B_smem[k_count * B_SMEM_SIZE_PER_TILE + WGMMA_K * _k]);
                 asm_wgmma_m64n32k8_tf32<1, 1, 1>(t_accu[_m], a_reg[_m][4 * _k], a_reg[_m][4 * _k + 1],
                                                  a_reg[_m][4 * _k + 2], a_reg[_m][4 * _k + 3], b_desc);
+                // Preserve FP32 accuracy using the existing WGMMA primitive:
+                // Ahi*Bhi + Alo*Bhi + Ahi*Blo; omitted Alo*Blo is second order.
+                asm_wgmma_m64n32k8_tf32<1, 1, 1>(t_accu[_m], a_low[_m][4 * _k], a_low[_m][4 * _k + 1],
+                                                 a_low[_m][4 * _k + 2], a_low[_m][4 * _k + 3], b_desc);
+                const uint64_t low_desc = make_smem_desc(&B_smem[U * TILE_N + k_count * B_SMEM_SIZE_PER_TILE + WGMMA_K * _k]);
+                asm_wgmma_m64n32k8_tf32<1, 1, 1>(t_accu[_m], a_reg[_m][4 * _k], a_reg[_m][4 * _k + 1],
+                                                 a_reg[_m][4 * _k + 2], a_reg[_m][4 * _k + 3], low_desc);
             }
             asm_warpgroup_commit_batch();
             asm_warpgroup_wait(0);
@@ -430,6 +543,9 @@ __device__ void mainloop_consumer(barrier bars_ready[],  // buffer finish consum
         // switch to next buffer
         cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
     }
+    // All warp groups must finish this phase before reused barriers/buffers
+    // can be initialized for the next one. Arrive alone does not wait.
+    __syncthreads();
 }
 
 template <uint32_t TILE_M, uint32_t TILE_N, uint32_t CONSUMER_WG_NUM>
@@ -458,6 +574,13 @@ __device__ void store_re_async_consumer(
             in_wg_tid                                                                          //
         );
     }
+
+    // Wait for every writer in this consumer warp group before its leader
+    // issues the TMA store. Each group owns a separate shared output tile.
+    if (consumer_wg_id == 0)
+        asm volatile("bar.sync 1, 128;" : : : "memory");
+    else
+        asm volatile("bar.sync 2, 128;" : : : "memory");
 
     // Wait for shared memory writes to be visible to TMA engine.
     cde::fence_proxy_async_shared_cta();
@@ -488,21 +611,23 @@ template <uint32_t IN_NUM_PATHS,        // in path数量
           uint32_t TILE_N,              // tile n大小
           uint32_t TILE_K = 32,         // tile k大小
           uint32_t PRODUCER_WG_NUM = 1, // producer warpgroup数量
-          uint32_t CONSUMER_WG_NUM = 2  // consumer warpgroup数量
+          uint32_t CONSUMER_WG_NUM = 2, // consumer warpgroup数量
+          uint32_t FUSION = 0          // bit 0: input/weights; bit 1: output
           >
 __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__ CUtensorMap x_map,   // x tensor maps
                                                          const __grid_constant__ CUtensorMap w_map,   // w tensor maps
                                                          const __grid_constant__ CUtensorMap out_map, // out tensor maps
-                                                         cg_T<IN_NUM_PATHS> cg_vals,                  // val
-                                                         idim_T<IN_NUM_PATHS> in_prefex_i_sum,        // [IN_NUM_PATHS]
-                                                         idim_T<OUT_NUM_PATHS> out_prefex_i_sum,      // [OUT_NUM_PATHS]
-                                                         idim_T<OUT_NUM_PATHS> out_path_count,        // [OUT_NUM_PATHS]
-                                                         idim_T<OUT_NUM_PATHS> out_path_in_istart,    // [OUT_NUM_PATHS]
+                                                         const __grid_constant__ cg_T<IN_NUM_PATHS> cg_vals,                  // val
+                                                         const __grid_constant__ idim_T<IN_NUM_PATHS> in_prefex_i_sum,        // [IN_NUM_PATHS]
+                                                         const __grid_constant__ idim_T<OUT_NUM_PATHS> out_prefex_i_sum,      // [OUT_NUM_PATHS]
+                                                         const __grid_constant__ idim_T<OUT_NUM_PATHS> out_path_count,        // [OUT_NUM_PATHS]
+                                                         const __grid_constant__ idim_T<OUT_NUM_PATHS> out_path_in_istart,    // [OUT_NUM_PATHS]
                                                          uint32_t B,                                  // batch size
                                                          uint32_t U,                                  // U
                                                          uint32_t V,                                  // V
                                                          uint32_t in_total_i,                         // input i的总数
-                                                         uint32_t out_total_i                         // output i的总数
+                                                         uint32_t out_total_i,                        // output i的总数
+                                                         const __grid_constant__ LinearNativeAccess native
 )
 {
     /* tensor shape:
@@ -518,6 +643,18 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
     uint32_t b_ntile_id = blockIdx.x;
     uint32_t b_mtile_id = blockIdx.y;
     uint32_t b_out_i_id = blockIdx.z;
+    if constexpr (FUSION) {
+        b_ntile_id = blockIdx.x % (V / TILE_N);
+        b_out_i_id = blockIdx.x / (V / TILE_N);
+    }
+    // Reuse node addresses throughout all K tiles and the output epilogue.
+    __shared__ int64_t row_ids[TILE_M];
+    if constexpr (FUSION) {
+        if (wg_id == 0) {
+            const uint32_t n = b_mtile_id * TILE_M + in_wg_tid;
+            row_ids[in_wg_tid] = n < B ? (native.ids ? native.ids[n] : n) : 0;
+        }
+    }
 
     // get path info
     uint32_t b_out_path_id = 0;
@@ -525,6 +662,13 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
     for (uint32_t n = 0; n < OUT_NUM_PATHS; ++n)
     {
         b_out_path_id = b_out_i_id >= out_prefex_i_sum._i[n] ? n : b_out_path_id;
+    }
+    LinearNativePath native_path{};
+    uint32_t native_angle = 0;
+    if constexpr (FUSION) {
+        native_path = native.paths[b_out_path_id];
+        native_angle = b_out_i_id - out_prefex_i_sum._i[b_out_path_id];
+        if constexpr (FUSION & 1) U = CEIL_DIV(native_path.ci, TILE_K) * TILE_K;
     }
     uint32_t b_out_reduce_loop_count = out_path_count._i[b_out_path_id];
 
@@ -544,8 +688,11 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
     constexpr uint32_t OUT_SMEM_SIZE = OUT_SMEM_SIZE_PER_CONS_WG * CONSUMER_WG_NUM;
     constexpr uint32_t A_SMEM_SIZE = A_SMEM_SIZE_PER_STAGE * TOTAL_STAGES;
     float *A_smem = smem; // must align 1024
-    float *O_smem = A_smem + A_SMEM_SIZE;
-    float *B_smem = O_smem + OUT_SMEM_SIZE;
+    // Weight staging, input staging, and output staging have disjoint
+    // lifetimes, separated by the existing CTA barriers. Share their storage.
+    static_assert(A_SMEM_SIZE >= OUT_SMEM_SIZE);
+    float *O_smem = A_smem;
+    float *B_smem = A_smem + A_SMEM_SIZE;
 
     // define & init barrier
     // for buffer id=s:
@@ -585,7 +732,11 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
 
             /* STEP1 (prepare loop): Fetch W tile and transpose (prepare loop)*/
             // We use O_smem as a tmp buffer (buffer size: TILE_M * TILE_N)
-            preloop_producer<TILE_N, TILE_K, TOTAL_STAGES>(bars_ready,   //
+            if constexpr (FUSION & 1) {
+                native_linear_producer<true, TILE_M, TILE_N, TILE_K, TOTAL_STAGES>(
+                    bars_ready, bars_filled, O_smem, native, native_path,
+                    native_angle, b_mtile_id, b_ntile_id, B, U, V, in_wg_tid, row_ids);
+            } else preloop_producer<TILE_N, TILE_K, TOTAL_STAGES>(bars_ready,   //
                                                            bars_filled,  //
                                                            O_smem,       //
                                                            &w_map,       //
@@ -596,7 +747,11 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
             );
 
             /* STEP2: Fetch X tile and do wgmma (main loop) */
-            mainloop_producer<TILE_M, TILE_K, A_SMEM_SIZE_PER_STAGE, TOTAL_STAGES>(bars_ready,  //
+            if constexpr (FUSION & 1) {
+                native_linear_producer<false, TILE_M, TILE_N, TILE_K, TOTAL_STAGES>(
+                    bars_ready, bars_filled, A_smem, native, native_path,
+                    native_angle, b_mtile_id, b_ntile_id, B, U, V, in_wg_tid, row_ids);
+            } else mainloop_producer<TILE_M, TILE_K, A_SMEM_SIZE_PER_STAGE, TOTAL_STAGES>(bars_ready,  //
                                                                                    bars_filled, //
                                                                                    A_smem,      //
                                                                                    &x_map,      //
@@ -650,6 +805,10 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
         }
 
         /* STEP3: Store accumulator */
+        if constexpr (FUSION & 2) {
+            native_linear_store<TILE_M, TILE_N, CONSUMER_WG_NUM>(O_smem, t_accu, native,
+                native_path, native_angle, b_mtile_id, b_ntile_id, B, consumer_wg_id, in_wg_tid, row_ids);
+        } else {
         store_re_async_consumer<TILE_M, TILE_N, CONSUMER_WG_NUM>(O_smem,         // output smem buffer base addr
                                                                  t_accu,         // accumulator regs
                                                                  &out_map,       // out tensor map
@@ -664,10 +823,11 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
         {
             cde::cp_async_bulk_wait_group_read<0>();
         }
+        }
     }
 }
 
-template <uint32_t IN_NUM_PATHS, uint32_t OUT_NUM_PATHS = 4>
+template <uint32_t IN_NUM_PATHS, uint32_t OUT_NUM_PATHS = 4, uint32_t FUSION = 0>
 void mutipath_equi_linear_fwd_f32(float *out,                                 // [B, out_total_i, V]
                                   float *x,                                   // [B, in_total_i, U]
                                   float *w,                                   // [IN_NUM_PATHS, U, V]
@@ -679,7 +839,8 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
                                   const uint32_t &U,                          // U
                                   const uint32_t &V,                          // V
                                   const std::vector<double> &cg_val_vec,      // cg_val
-                                  const cudaStream_t &cur_stream              // current stream
+                                  const cudaStream_t &cur_stream,             // current stream
+                                  LinearNativeAccess native = {}
 )
 {
     constexpr uint32_t PRODUCER_WG_NUM = 1; // producer warpgroup数量
@@ -690,19 +851,38 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
     constexpr uint32_t TILE_N = 32;
 
     static_assert(TILE_K == 32);
-    assert(V % TILE_N == 0);
+    if (U == 0 || U % TILE_K || V == 0 || V % TILE_N)
+        throw std::invalid_argument("WGMMA Linear channels must be positive multiples of 32");
+    if (in_i_dims_vec.empty() || in_i_dims_vec.size() > IN_NUM_PATHS ||
+        out_i_dims_vec.empty() || out_i_dims_vec.size() > OUT_NUM_PATHS ||
+        cg_val_vec.size() != in_i_dims_vec.size())
+        throw std::invalid_argument("Invalid WGMMA Linear path metadata");
+    std::vector<int64_t> groups;
+    uint32_t in_sum = 0, out_sum = 0;
+    for (auto dim : in_i_dims_vec) {
+        if (dim <= 0) throw std::invalid_argument("Angular dimensions must be positive");
+        in_sum += dim;
+        if (groups.empty() || groups.back() != dim) groups.push_back(dim);
+    }
+    for (auto dim : out_i_dims_vec) out_sum += dim;
+    if (groups != out_i_dims_vec || in_sum != in_total_i || out_sum != out_total_i)
+        throw std::invalid_argument("WGMMA Linear paths must be grouped by output angular dimension");
+    if (B == 0) return;
 
-    idim_T<IN_NUM_PATHS> in_prefex_i_sum;
-    cal_prefex_sum<IN_NUM_PATHS>(in_prefex_i_sum, in_i_dims_vec);
+    idim_T<IN_NUM_PATHS> in_prefex_i_sum{};
+    for (uint32_t p = 1; p < in_i_dims_vec.size(); ++p)
+        in_prefex_i_sum._i[p] = in_prefex_i_sum._i[p-1] + in_i_dims_vec[p-1];
 
-    idim_T<OUT_NUM_PATHS> out_prefex_i_sum;
-    cal_prefex_sum<OUT_NUM_PATHS>(out_prefex_i_sum, out_i_dims_vec);
+    idim_T<OUT_NUM_PATHS> out_prefex_i_sum{};
+    for (uint32_t p = 1; p < OUT_NUM_PATHS; ++p)
+        out_prefex_i_sum._i[p] = p < out_i_dims_vec.size()
+            ? out_prefex_i_sum._i[p-1] + out_i_dims_vec[p-1] : out_total_i;
 
-    idim_T<OUT_NUM_PATHS> out_path_count;
+    idim_T<OUT_NUM_PATHS> out_path_count{};
     uint32_t _cur_cnt = 0;
     uint32_t _cur_op = 0;
     uint32_t _last_i_dim = in_i_dims_vec[0];
-    for (uint32_t p = 0; p < IN_NUM_PATHS; ++p)
+    for (uint32_t p = 0; p < in_i_dims_vec.size(); ++p)
     {
         if (in_i_dims_vec[p] == _last_i_dim)
         {
@@ -718,9 +898,9 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
     }
     out_path_count._i[_cur_op] = _cur_cnt;
 
-    idim_T<OUT_NUM_PATHS> out_path_in_istart;
+    idim_T<OUT_NUM_PATHS> out_path_in_istart{};
     uint32_t _cur_i_path = 0;
-    for (uint32_t op = 0; op < OUT_NUM_PATHS; ++op)
+    for (uint32_t op = 0; op < out_i_dims_vec.size(); ++op)
     {
         out_path_in_istart._i[op] = in_prefex_i_sum._i[_cur_i_path];
         _cur_i_path += out_path_count._i[op];
@@ -731,6 +911,7 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
     CUtensorMap x_map{};
     CUtensorMap w_map{};
     CUtensorMap out_map{};
+    if constexpr (!(FUSION & 1)) {
     init_3d_tensormap(&x_map,                                        // tensor_map_ptr
                       static_cast<void *>(x),                        // tensor_ptr
                       B,                                             // B
@@ -745,7 +926,7 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
     );
     init_3d_tensormap(&w_map,                 // tensor_map_ptr
                       static_cast<void *>(w), // tensor_ptr
-                      IN_NUM_PATHS,           // B
+                      in_i_dims_vec.size(),   // B
                       U,                      // M
                       V,                      // N
                       U * V,                  // stride B
@@ -754,6 +935,8 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
                       TILE_K,                 // box M
                       TILE_N                  // box N
     );
+    }
+    if constexpr (!(FUSION & 2)) {
     init_3d_tensormap(&out_map,                   // tensor_map_ptr
                       static_cast<void *>(out),   // tensor_ptr
                       B,                          // B
@@ -765,21 +948,23 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
                       1,                          // box M
                       TILE_N                      // box N
     );
+    }
     dim3 grid(CEIL_DIV(V, TILE_N), CEIL_DIV(B, TILE_M), out_total_i);
+    if constexpr (FUSION) grid = dim3(CEIL_DIV(V, TILE_N) * out_total_i, CEIL_DIV(B, TILE_M), 1);
     dim3 block(128, WARPGROUP_NUM);
 
     constexpr uint32_t STAGES = 2;
     size_t SMEM_SIZE = sizeof(float) * ((TILE_M * TILE_K) * STAGES // A_smem
-                                        + (TILE_N * V)             // B_smem
-                                        + (TILE_M * TILE_N)        // Out_smem
+                                        + (2 * TILE_N * U)         // B high + residual
                                        );
 
     auto cuda_kernel = mutipath_equi_linear_fwd_f32_tf32_kernel<IN_NUM_PATHS, OUT_NUM_PATHS, TILE_M, TILE_N, TILE_K,
-                                                                PRODUCER_WG_NUM, CONSUMER_WG_NUM>;
-    cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
+                                                                PRODUCER_WG_NUM, CONSUMER_WG_NUM, FUSION>;
+    auto status = cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x_map, w_map, out_map, cg_vals, in_prefex_i_sum,
                                                         out_prefex_i_sum, out_path_count, out_path_in_istart, B, U, V,
-                                                        in_total_i, out_total_i);
+                                                        in_total_i, out_total_i, native);
 }
 
 // wrapper
@@ -817,4 +1002,26 @@ void mutipath_equi_linear_fwd_f32_impl(const uint32_t &IN_NUM_PATHS,           /
     };
     // 调用lambda，完美转发参数
     call_impl(out, x, w, i_dims_vec, out_i_dims_vec, B, total_i, out_total_i, U, V, cg_val_vec, cur_stream);
+}
+
+// General metadata entry reuses the original TMA/warp-specialized WGMMA kernel.
+// Capacities bound launch metadata only; unused output groups are never selected.
+void multipath_equi_linear_fwd_f32_general(float *out, float *x, float *w,
+    const std::vector<int64_t>& in_dims, const std::vector<int64_t>& out_dims,
+    uint32_t batch, uint32_t in_angles, uint32_t out_angles, uint32_t u, uint32_t v,
+    const std::vector<double>& coefficients, cudaStream_t stream) {
+    mutipath_equi_linear_fwd_f32<32,16>(out,x,w,in_dims,out_dims,batch,
+        in_angles,out_angles,u,v,coefficients,stream);
+}
+
+void multipath_equi_linear_fwd_f32_native(float *out, float *x, float *w,
+    const std::vector<int64_t>& dims, uint32_t batch, uint32_t angles,
+    uint32_t u, uint32_t v, const std::vector<double>& coefficients,
+    cudaStream_t stream, LinearNativeAccess access, int fusion) {
+    switch (fusion) {
+    case 1: mutipath_equi_linear_fwd_f32<32,16,1>(out,x,w,dims,dims,batch,angles,angles,u,v,coefficients,stream,access); break;
+    case 2: mutipath_equi_linear_fwd_f32<32,16,2>(out,x,w,dims,dims,batch,angles,angles,u,v,coefficients,stream,access); break;
+    case 3: mutipath_equi_linear_fwd_f32<32,16,3>(out,x,w,dims,dims,batch,angles,angles,u,v,coefficients,stream,access); break;
+    default: throw std::invalid_argument("Invalid WGMMA fusion mode");
+    }
 }

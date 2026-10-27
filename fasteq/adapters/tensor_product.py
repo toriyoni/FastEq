@@ -168,6 +168,97 @@ class TensorProductPlan:
         )
         return x.index_select(1, ids)
 
+    def _uniform_metadata(self, x):
+        key = (x.device, x.dtype)
+        if key not in self.cache:
+            rows = sorted(self.rows, key=lambda r: r[0][3])
+            with torch.inference_mode(False), torch.no_grad():
+                ids = torch.tensor(
+                    [r[0] for r in rows], dtype=torch.int32, device=x.device
+                ).reshape(-1, 4)
+                meta = {
+                    name: ids[:, i].contiguous()
+                    for i, name in enumerate(("i_list", "j_list", "k_list", "v_list"))
+                }
+                meta["coeff_list"] = x.new_tensor([r[1] for r in rows])
+            meta.update(
+                w_seg_num=self.dims[0], x_seg_num=self.dims[1],
+                y_seg_num=self.dims[2], out_seg_num=self.dims[3],
+                u_dim=self.width, size_list=[self.wsize, *self.sizes],
+            )
+            self.cache[key] = meta
+        return self.cache[key]
+
+    def indexed(self, module, x, y, weight, edge_index):
+        """Reuse native Uniform1D gather/scatter, retaining node-level layouts.
+
+        Both graph ends refer to x's node set. External weights and y have one
+        row per edge. The original unfused path remains for non-uniform plans.
+        """
+        if not self.o2 and self.cg_state != self._cg_state(module):
+            module._fasteq_plan = TensorProductPlan(module, self.o2)
+            return module._fasteq_plan.indexed(module, x, y, weight, edge_index)
+        if self.vector:
+            messages = self(module, x[edge_index[0]], y, weight)
+            return messages.new_zeros(x.shape[0], self.sizes[2]).index_add(0, edge_index[1], messages)
+        if not x.is_cuda or x.dtype not in (torch.float32, torch.float64):
+            raise TypeError("Adapted indexed tensor products require CUDA FP32/FP64")
+        weight = module._get_weights(weight)
+        if any(v.dtype != x.dtype or v.device != x.device for v in (y, weight)):
+            raise ValueError("Tensor product features and weights must share dtype and device")
+        if isinstance(edge_index, tuple):
+            if len(edge_index) != 2:
+                raise ValueError("Indexed tensor product requires sender and receiver indices")
+            sources = edge_index
+            if sources[0].ndim != 1 or sources[1].shape != sources[0].shape:
+                raise ValueError("Sender and receiver indices must be equal-length vectors")
+        else:
+            if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+                raise ValueError("edge_index must have shape [2, edges]")
+            sources = (edge_index,)
+        if any(v.device != x.device or v.dtype not in (torch.int32, torch.int64) for v in sources):
+            raise ValueError("Graph indices must be CUDA int32/int64 on the feature device")
+        n = edge_index[0].numel()
+        if max(n, x.shape[0]) > 2**31 - 1:
+            raise ValueError("Uniform1D graph indices require fewer than 2**31 rows")
+        if x.ndim != 2 or y.shape != (n, self.sizes[1]) or x.shape[1] != self.sizes[0]:
+            raise ValueError("Indexed tensor product requires node x and edge y matrices")
+        if not n:
+            return x.new_zeros(x.shape[0], self.sizes[2]) + (x.sum() + y.sum() + weight.sum()) * 0
+        shared = weight.numel() == self.weight_numel
+        if torch.is_grad_enabled() and weight.requires_grad:
+            shared = False
+        rows = 1 if shared else n
+        weight = (weight.reshape(1, 0) if not self.weight_numel else
+                  weight.reshape(-1, self.weight_numel)).expand(rows, self.weight_numel)
+        if self.dummy:
+            ones = self.constants.get((x.device, x.dtype, rows, self.dummy),
+                                      lambda: x.new_ones(rows, self.dummy))
+            weight = torch.cat((weight, ones), -1) if self.weight_numel else ones
+        # Hold the source object as well as its version: a reused storage
+        # address must never make a new graph reuse stale converted indices.
+        # Inference tensors have no version counters; recopy their indices on
+        # each invocation so an in-place graph update cannot reuse stale data.
+        versions = None if any(v.is_inference() for v in sources) else tuple(v._version for v in sources)
+        cache = getattr(self, "graph_indices", None)
+        if (versions is None or cache is None or cache[1] != versions or
+                len(cache[0]) != len(sources) or any(a is not b for a, b in zip(cache[0], sources))):
+            with torch.inference_mode(False), torch.no_grad():
+                ids = (tuple(v.to(dtype=torch.int32, copy=True).contiguous() for v in edge_index)
+                       if isinstance(edge_index, tuple) else
+                       edge_index.to(dtype=torch.int32, copy=True).contiguous())
+            cache = (sources, versions, ids)
+            self.graph_indices = cache if versions is not None else None
+        ids = cache[2]
+        from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
+
+        out = fast_uniform1d_jit(
+            weight.contiguous(), self._layout(x, 0).contiguous(),
+            self._layout(y, 1).contiguous(), {1: ids[0]}, {0: ids[1]},
+            self._uniform_metadata(x), False,
+        )
+        return self._layout(out, 2, True)
+
     def __call__(self, module, x, y, weight=None):
         if not self.o2 and self.cg_state != self._cg_state(module):
             # .to(), deepcopy and load_state_dict can replace/cast CG buffers.
@@ -224,29 +315,6 @@ class TensorProductPlan:
         if not self.vector and n:
             from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
 
-            key = (x.device, x.dtype)
-            if key not in self.cache:
-                rows = sorted(self.rows, key=lambda r: r[0][3])
-                with torch.inference_mode(False), torch.no_grad():
-                    ids = torch.tensor(
-                        [r[0] for r in rows], dtype=torch.int32, device=x.device
-                    ).reshape(-1, 4)
-                    meta = {
-                        name: ids[:, i].contiguous()
-                        for i, name in enumerate(
-                            ("i_list", "j_list", "k_list", "v_list")
-                        )
-                    }
-                    meta["coeff_list"] = x.new_tensor([r[1] for r in rows])
-                meta.update(
-                    w_seg_num=self.dims[0],
-                    x_seg_num=self.dims[1],
-                    y_seg_num=self.dims[2],
-                    out_seg_num=self.dims[3],
-                    u_dim=self.width,
-                    size_list=[self.wsize, *self.sizes],
-                )
-                self.cache[key] = meta
             ix = indices(x, n, sequence=True)
             result = fast_uniform1d_jit(
                 w.contiguous(),
@@ -254,7 +322,7 @@ class TensorProductPlan:
                 self._layout(y, 1).contiguous(),
                 {1: ix},
                 {},
-                self.cache[key],
+                self._uniform_metadata(x),
                 False,
             )
             result = self._layout(result, 2, True)

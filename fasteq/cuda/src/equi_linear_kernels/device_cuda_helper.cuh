@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 #include "./ptx_inst.cuh"
@@ -17,7 +18,7 @@ template <uint32_t _N> struct idim_T
 
 template <uint32_t _N, typename DType = float> struct cg_T
 {
-    DType _v[_N];
+    DType _v[_N]{};
 
     __host__ cg_T(const std::vector<double> &cg_vec)
     {
@@ -275,6 +276,11 @@ inline void init_3d_tensormap(
                                l2_promotion,
                                // Any element that is outside of bounds will be set to zero by the TMA transfer.
                                oob_fill);
+    if (res != CUDA_SUCCESS) {
+        const char* message = nullptr;
+        cuGetErrorString(res, &message);
+        throw std::runtime_error(std::string("FastEq TMA descriptor: ") + (message ? message : "unknown error"));
+    }
 }
 
 // creates a tensor map to describe a two-dimensional row-major array of size B x M x N

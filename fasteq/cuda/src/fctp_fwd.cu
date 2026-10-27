@@ -187,6 +187,8 @@ __global__ void fused_fctp_kernel_fwd_multipath(
 }
 
 
+#include "fctp_shared.cuh"
+
 constexpr int W_TILE = 16;
 
 template<typename scalar_t>
@@ -294,14 +296,8 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
             int w0  = wv << 2;              // 全局 w 起始（保证 4 对齐）
 
             const size_t off = ((size_t)u * V + (size_t)v) * W + (size_t)w0;
-            const Vec4 r = *reinterpret_cast<const Vec4*>(W_p + off);
-
             int w_local0 = w0 - w_base;     // 0..W_this-1，步长为 4
-
-            sh_Wt[((size_t)w_local0 + 0) * U_pad + u] = (scalar_t)r.x;
-            sh_Wt[((size_t)w_local0 + 1) * U_pad + u] = (scalar_t)r.y;
-            sh_Wt[((size_t)w_local0 + 2) * U_pad + u] = (scalar_t)r.z;
-            sh_Wt[((size_t)w_local0 + 3) * U_pad + u] = (scalar_t)r.w;
+            fasteq_fctp::transpose_four(sh_Wt, U_pad, w_local0, u, W_p + off);
         }
 
         __syncthreads();

@@ -1,6 +1,6 @@
 // Sparse angular descriptors, dense channel contractions, bounded CUDA scratch.
 // Autograd remains the four-role multilinear FastEq Function; this plan owns
-// only stream-ordered CUDA packing/scattering and full-precision cuBLAS math.
+// only stream-ordered CUDA packing/scattering and FastEq's native matrix math.
 #include "jit_runtime.h"
 #include <ATen/ATen.h>
 #include <ATen/core/grad_mode.h>
@@ -33,7 +33,8 @@ struct SegmentedPlan {
     std::array<int64_t, 4> dimensions;
     std::vector<std::array<int64_t, 12>> terms;
     std::vector<double> coefficients;
-    std::shared_ptr<Kernel> pack, scatter, outer;
+    std::shared_ptr<Kernel> pack, scatter, outer, paired;
+    bool native_fusion;
     Tensor descriptors, scales;
     std::vector<std::pair<int,int>> groups;
     std::vector<bool> angular_gemm;
@@ -42,9 +43,11 @@ struct SegmentedPlan {
                   const std::vector<std::vector<int64_t>>& paths,
                   const std::vector<double>& scales,
                   std::shared_ptr<Kernel> p, std::shared_ptr<Kernel> s,
-                  std::shared_ptr<Kernel> o, const Tensor& tables, const Tensor& factors)
+                  std::shared_ptr<Kernel> o, std::shared_ptr<Kernel> pair,
+                  const Tensor& tables, const Tensor& factors, bool fuse)
         : coefficients(scales), pack(std::move(p)), scatter(std::move(s)),
-          outer(std::move(o)),descriptors(tables),scales(factors) {
+          outer(std::move(o)),paired(std::move(pair)),native_fusion(fuse),
+          descriptors(tables),scales(factors) {
         TORCH_CHECK(dims.size() == 4 && paths.size() == scales.size(), "Invalid TP plan");
         std::copy(dims.begin(), dims.end(), dimensions.begin());
         for (const auto& path : paths) {
@@ -72,6 +75,32 @@ struct SegmentedPlan {
             }
             groups.emplace_back(begin,end);angular_gemm.push_back(contiguous);begin=end;
         }
+    }
+
+    // A column-strided angular slice is a legal input/output for native GEMM.
+    // Retain storage_offset: views can originate from sliced model tensors.
+    Tensor angular_view(const Tensor& value, int64_t start, int64_t n,
+                        int64_t base, int64_t stride, int64_t channels) const {
+        return value.as_strided({n,channels},{value.size(1),stride},
+                                value.storage_offset()+start*value.size(1)+base);
+    }
+
+    bool paired_scattering(const Tensor& matrix, const std::vector<Tensor>& values,
+                           Tensor& dx, Tensor& dy, int64_t start, int64_t n,
+                           const std::array<int64_t,12>& p, double coefficient,
+                           uint64_t stream) const {
+        const int64_t c1=p[8],c2=p[9];
+        const int64_t shared=(c2*(c1+1)+c1+c2)*matrix.element_size();
+        if (!native_fusion || shared>48*1024 || c1>128 || c2>128) return false;
+        paired->launch({pointer(matrix),pointer(values[1]),pointer(values[2]),
+            pointer(dx),pointer(dy),static_cast<uint64_t>(start),static_cast<uint64_t>(n),
+            static_cast<uint64_t>(values[1].size(1)),static_cast<uint64_t>(values[2].size(1)),
+            static_cast<uint64_t>(p[2]),static_cast<uint64_t>(p[3]),
+            static_cast<uint64_t>(p[4]),static_cast<uint64_t>(p[5]),
+            static_cast<uint64_t>(c1),static_cast<uint64_t>(c2),
+            static_cast<uint64_t>(dx.size(1)),static_cast<uint64_t>(dy.size(1)),
+            scalar_bits(coefficient,matrix.scalar_type())},n,1,128,stream,shared);
+        return true;
     }
 
     void packing(const Tensor& a, const Tensor& b, const Tensor& out, int op,
@@ -123,14 +152,17 @@ struct SegmentedPlan {
             const auto& p=terms[group.first];
             const int64_t c1=p[8],c2=p[9],co=p[10];
             const int64_t chunk=std::min<int64_t>(rows,std::min<int64_t>(32768,
-                budget/element_bytes/(c1*c2+co)));
+                budget/element_bytes/(c1*c2+(native_fusion?0:co))));
             TORCH_CHECK(chunk>0,"Angular UVW scratch exceeds plan budget");
             Tensor first=at::empty({chunk,c1*c2},values[1].options());
-            Tensor second=at::empty({chunk,co},values[1].options());
+            Tensor second=native_fusion?Tensor():at::empty({chunk,co},values[1].options());
             const auto weight=values[0].reshape({-1}).narrow(0,p[1],c1*c2*co).view({c1*c2,co});
             for (int64_t start=0;start<rows;start+=chunk) {
                 const int64_t n=std::min(chunk,rows-start);
-                Tensor a=first.narrow(0,0,n),b=second.narrow(0,0,n);
+                Tensor a=first.narrow(0,0,n),b;
+                if (native_fusion)
+                    b=angular_view(role==3?result:values[3],start,n,p[6],p[7],co);
+                else b=second.narrow(0,0,n);
                 if (role==0 || role==3) {
                     if (angular_gemm[g]) {
                         const int64_t angular=group.second-group.first;
@@ -148,15 +180,18 @@ struct SegmentedPlan {
                         static_cast<uint64_t>(group.second),static_cast<uint64_t>(c1),static_cast<uint64_t>(c2)},
                         (n*c1*c2+255)/256,1,256,stream);
                     if (role==3) {
-                        fasteq_jit::gemm_into(b,a,weight,1.,0.);
-                        scattering(b,values[2],result,1,start,n,0,1,p[6],p[7],co,1,1.,stream);
+                        fasteq_jit::gemm_into(b,a,weight,1.,native_fusion?1.:0.);
+                        if (!native_fusion)
+                            scattering(b,values[2],result,1,start,n,0,1,p[6],p[7],co,1,1.,stream);
                     } else {
-                        packing(values[3],values[3],b,0,start,n,p[6],p[7],co,0,1,1,1,stream);
+                        if (!native_fusion)
+                            packing(values[3],values[3],b,0,start,n,p[6],p[7],co,0,1,1,1,stream);
                         Tensor destination=result.reshape({-1}).narrow(0,p[1],c1*c2*co).view({c1*c2,co});
                         fasteq_jit::gemm_into(destination,a.transpose(0,1),b,1.,1.);
                     }
                 } else {
-                    packing(values[3],values[3],b,0,start,n,p[6],p[7],co,0,1,1,1,stream);
+                    if (!native_fusion)
+                        packing(values[3],values[3],b,0,start,n,p[6],p[7],co,0,1,1,1,stream);
                     fasteq_jit::gemm_into(a,b,weight.transpose(0,1),1.,0.);
                     for (int t=group.first;t<group.second;++t) {
                         const auto& q=terms[t];
@@ -188,20 +223,26 @@ struct SegmentedPlan {
             const auto& p=terms[group.first];
             const int64_t c1=p[8],c2=p[9],co=p[10];
             const int64_t chunk=std::min<int64_t>(rows,std::min<int64_t>(32768,
-                budget/values[1].element_size()/(c1*c2+co)));
+                budget/values[1].element_size()/(c1*c2+(native_fusion?0:co))));
             TORCH_CHECK(chunk>0,"Paired UVW scratch exceeds plan budget");
             Tensor first=at::empty({chunk,c1*c2},values[1].options());
-            Tensor second=at::empty({chunk,co},values[1].options());
+            Tensor second=native_fusion?Tensor():at::empty({chunk,co},values[1].options());
             const Tensor weight=values[0].reshape({-1}).narrow(0,p[1],c1*c2*co).view({c1*c2,co});
             for (int64_t start=0;start<rows;start+=chunk) {
                 const int64_t n=std::min(chunk,rows-start);
-                Tensor a=first.narrow(0,0,n),b=second.narrow(0,0,n);
-                packing(values[3],values[3],b,0,start,n,p[6],p[7],co,0,1,1,1,stream);
+                Tensor a=first.narrow(0,0,n),b;
+                if (native_fusion) b=angular_view(values[3],start,n,p[6],p[7],co);
+                else {
+                    b=second.narrow(0,0,n);
+                    packing(values[3],values[3],b,0,start,n,p[6],p[7],co,0,1,1,1,stream);
+                }
                 fasteq_jit::gemm_into(a,b,weight.transpose(0,1),1.,0.);
                 for (int t=group.first;t<group.second;++t) {
                     const auto& q=terms[t];
-                    scattering(a,values[2],resultx,2,start,n,q[4],q[5],q[2],q[3],c1,c2,coefficients[t],stream);
-                    scattering(a,values[1],resulty,3,start,n,q[2],q[3],q[4],q[5],c2,c1,coefficients[t],stream);
+                    if (!paired_scattering(a,values,resultx,resulty,start,n,q,coefficients[t],stream)) {
+                        scattering(a,values[2],resultx,2,start,n,q[4],q[5],q[2],q[3],c1,c2,coefficients[t],stream);
+                        scattering(a,values[1],resulty,3,start,n,q[2],q[3],q[4],q[5],c2,c1,coefficients[t],stream);
+                    }
                 }
             }
         }
@@ -216,7 +257,8 @@ void bind_segmented_product(py::module_& module) {
                       const std::vector<std::vector<int64_t>>&,
                       const std::vector<double>&,
                       std::shared_ptr<Kernel>,std::shared_ptr<Kernel>,
-                      std::shared_ptr<Kernel>,const Tensor&,const Tensor&>())
+                      std::shared_ptr<Kernel>,std::shared_ptr<Kernel>,
+                      const Tensor&,const Tensor&,bool>())
         .def("evaluate", &SegmentedPlan::evaluate,py::call_guard<py::gil_scoped_release>())
         .def("evaluate_features", &SegmentedPlan::evaluate_features,py::call_guard<py::gil_scoped_release>());
 }

@@ -1,6 +1,6 @@
 """General FastEq CUDA Linear with indexed element and expert weights.
 
-The legacy ``fast_equi_linear`` entry remains unchanged. This API accepts
+The legacy ``fast_equi_linear`` entry point is retained. This API accepts
 arbitrary dense irrep paths and uses static tiled kernels, rather than the
 legacy kernel's fixed angular output and MACE path-count specializations.
 """
@@ -256,6 +256,10 @@ def indexed_linear(metadata, features, weight, node_type):
             weight,
             features.new_empty((0,)),
         )
+    if os.environ.get("FASTEQ_EXPERIMENTAL_LINEAR_WGMMA") == "1":
+        from .wgmma_linear import eligible, wgmma_linear
+        if eligible(metadata, features, weight):
+            return wgmma_linear(metadata, features, weight, node_type)
     return _plan(metadata, features.dtype, features.device).forward(
         features, weight, node_type
     )

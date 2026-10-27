@@ -10,6 +10,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 @pytest.fixture(autouse=True)
 def opt_in_simt(monkeypatch):
     monkeypatch.setenv("FASTEQ_EXPERIMENTAL_LINEAR_SIMT", "1")
+    monkeypatch.setenv("FASTEQ_EXPERIMENTAL_LINEAR_INDEXED_TILES", "1")
     _plan.cache_clear()
     yield
     _plan.cache_clear()
@@ -50,6 +51,7 @@ def chain(metadata, pos, projection, weight, ids, native):
 @pytest.mark.parametrize("layout,experts,elements,nodes", [
     ("ir_mul", 1, 1, 1025), ("mul_ir", 3, 1, 1025),
     ("ir_mul", 1, 2, 1025), ("mul_ir", 1, 1, 1023),
+    ("mul_ir", 2, 3, 1025), ("ir_mul", 3, 4, 1031),
 ])
 def test_simt_fragment_tails_experts_and_fallback_force_loss(layout, experts, elements, nodes):
     torch.manual_seed(3921)
@@ -89,3 +91,39 @@ def test_simt_multiple_paths_same_output_group():
         else:
             for actual_gradient, expected_gradient in zip(actual_gradients, [*first, *second], strict=True):
                 torch.testing.assert_close(actual_gradient, expected_gradient, atol=3e-5, rtol=5e-5)
+
+
+def test_indexed_tiles_missing_bank_and_noncontiguous_features():
+    torch.manual_seed(2701)
+    metadata = (128, 64, 8192, 1, "mul_ir",
+                ((0, 0, 0, 64, 64, 1, 0.125),
+                 (64, 4096, 0, 64, 64, 1, 0.125)))
+    x = torch.randn(1025, 256, device="cuda")[:, ::2].requires_grad_()
+    w = torch.randn(4, 1, 8192, device="cuda", requires_grad=True)
+    # Banks 0 and 2 are absent; every partial of their dW must still be zero.
+    ids = (torch.arange(1025, device="cuda") % 2) * 2 + 1
+    results = []
+    for native in (False, True):
+        xx, ww = x.detach().requires_grad_(), w.detach().clone().requires_grad_()
+        y = indexed_linear(repr(metadata), xx, ww, ids) if native else reference(metadata, xx, ww, ids)
+        first = torch.autograd.grad(y.square().mean(), (xx, ww), create_graph=True)
+        second = torch.autograd.grad(sum(v.square().mean() for v in first), (xx, ww))
+        results.append((y, *first, *second))
+    for actual, expected in zip(results[1], results[0], strict=True):
+        torch.testing.assert_close(actual, expected, atol=3e-5, rtol=5e-5)
+    assert torch.count_nonzero(results[1][2][::2]) == 0
+
+
+def test_indexed_weight_adjoint_does_not_mix_nonfinite_banks():
+    from fasteq.ops.indexed_linear import _contract
+    metadata = (64, 64, 4096, 1, "mul_ir", ((0, 0, 0, 64, 64, 1, 0.125),))
+    x = torch.randn(1025, 64, device="cuda")
+    w = torch.empty(4, 1, 4096, device="cuda")
+    ids = (torch.arange(1025, device="cuda") % 2) * 2 + 1
+    gy = torch.ones_like(x)
+    gy[ids == 1] = float("nan")
+    dw = _contract(repr(metadata), 1, ids, 4, x, w, gy)
+    assert torch.isnan(dw[1]).all()
+    assert torch.count_nonzero(dw[::2]) == 0
+    expected = (x[ids == 3].sum(0) * 0.125)[:, None].expand(64, 64)
+    torch.testing.assert_close(dw[3, 0].reshape(64, 64), expected, atol=3e-5, rtol=5e-5)

@@ -114,6 +114,9 @@ void bind_modulation(py::module_&);
 #ifdef FASTEQ_SEGMENTED_PRODUCT
 void bind_segmented_product(py::module_&);
 #endif
+#ifdef FASTEQ_FCTP_GENERAL
+void bind_fctp_general(py::module_&);
+#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     using fasteq_jit::Kernel;
@@ -154,5 +157,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
 #endif
 #ifdef FASTEQ_SEGMENTED_PRODUCT
     bind_segmented_product(module);
+#endif
+#ifdef FASTEQ_FCTP_GENERAL
+    bind_fctp_general(module);
 #endif
 }

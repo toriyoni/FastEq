@@ -32,7 +32,10 @@ extern "C" __global__ void run(
     // A/B reduction tiles in padded shared memory. Four warps each own
     // eight rows and one column per lane; no TF32 conversion is involved.
     // ROLE8: X W; ROLE9: Y W^T; ROLE10: chunked X^T Y.
-    const int* tile = tiles + blockIdx.y * 4;
+    // A CTA owns one weight bank. Mask native rows on load/store rather than
+    // materializing per-bank gathers; reuse the existing shared SIMT tiles.
+    const int element = blockIdx.y / tile_count;
+    const int* tile = tiles + (blockIdx.y % tile_count) * 4;
     const int* group = groups + tile[0] * 5;
     const int expert = tile[1], lane = threadIdx.x & 31, warp = threadIdx.x / 32;
 #if FASTEQ_LINEAR_ROLE == 10
@@ -66,10 +69,12 @@ extern "C" __global__ void run(
                 const long long node = (long long)blockIdx.x * chunk_span + k / path[5];
                 const int angle = k % path[5], channel = first_row + c;
                 a_tile[c][r] = k < reduction && node < nodes && channel < path[3]
+                    && (elements == 1 || types[node] == element)
                     ? x[node * din + feature_offset(path[0], path[3], path[5], expert,
                                                    channel, angle, experts, ir_mul)] : scalar(0);
                 const int column = first_col + c;
                 b_tile[r][c] = k < reduction && node < nodes && column < path[4]
+                    && (elements == 1 || types[node] == element)
                     ? y[node * dout + feature_offset(path[2], path[4], path[5], expert,
                                                     column, angle, experts, ir_mul)] : scalar(0);
 #else
@@ -78,21 +83,23 @@ extern "C" __global__ void run(
                 const int angle = row % group[2];
 #if FASTEQ_LINEAR_ROLE == 9
                 a_tile[r][c] = row < row_count && k < reduction
+                    && (elements == 1 || types[node] == element)
                     ? y[node * dout + feature_offset(path[2], path[4], path[5], expert,
                                                     k, angle, experts, ir_mul)] : scalar(0);
                 // Coalesced weight rows become columns in the B tile.
                 const int channel = first_col + r;
                 b_tile[c][r] = channel < path[3] && k < reduction
-                    ? weight[(long long)expert * numel + path[1] + (long long)channel * path[4] + k]
+                    ? weight[((long long)element * experts + expert) * numel + path[1] + (long long)channel * path[4] + k]
                     : scalar(0);
 #else
                 a_tile[r][c] = row < row_count && k < reduction
+                    && (elements == 1 || types[node] == element)
                     ? x[node * din + feature_offset(path[0], path[3], path[5], expert,
                                                    k, angle, experts, ir_mul)] : scalar(0);
                 const long long u = k0 + r;
                 const int column = first_col + c;
                 b_tile[r][c] = u < reduction && column < path[4]
-                    ? weight[(long long)expert * numel + path[1] + u * path[4] + column]
+                    ? weight[((long long)element * experts + expert) * numel + path[1] + u * path[4] + column]
                     : scalar(0);
 #endif
 #endif
@@ -116,12 +123,13 @@ extern "C" __global__ void run(
         const long long row = first_row + warp + 4 * i;
         if (row < row_count && column < col_count) {
 #if FASTEQ_LINEAR_ROLE == 10
-            result[((long long)blockIdx.x * experts + expert) * numel + group[0]
+            result[(((long long)blockIdx.x * elements + element) * experts + expert) * numel + group[0]
                    + row * group[2] + column] = total[i];
 #else
             const auto offset = feature_offset(group[0], group[1], group[2], expert,
                                                column, row % group[2], experts, ir_mul);
-            result[(row / group[2]) * (FASTEQ_LINEAR_ROLE == 9 ? din : dout) + offset] = total[i];
+            if (elements == 1 || types[row / group[2]] == element)
+                result[(row / group[2]) * (FASTEQ_LINEAR_ROLE == 9 ? din : dout) + offset] = total[i];
 #endif
         }
     }

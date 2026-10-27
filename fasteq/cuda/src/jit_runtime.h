@@ -7,7 +7,9 @@
 #include <ATen/core/Tensor.h>
 
 namespace fasteq_jit {
-// Full-precision CUDA GEMM helpers implemented by indexed_linear_plan.cpp.
+// FastEq-owned CUDA matrix primitive; no external matrix backend is called.
+void native_gemm_into(at::Tensor& destination, const at::Tensor& left,
+                      const at::Tensor& right, double alpha, double beta);
 void gemm_into(at::Tensor& destination, const at::Tensor& left,
                const at::Tensor& right, double alpha, double beta);
 void batched_gemm_into(at::Tensor& destination, const at::Tensor& left,

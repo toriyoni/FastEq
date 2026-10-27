@@ -5,6 +5,8 @@ scalar MLP, graph softmax, neighbor construction or checkpoints are changed.
 """
 
 from copy import deepcopy
+import math
+import os
 from types import MethodType
 
 import torch
@@ -34,10 +36,35 @@ def _product_wrapper(self, x, y, weight=None):
 
 
 def _scatter_wrapper(self, x, y, weight, edge_index):
+    if os.environ.get("FASTEQ_TP_GRAPH_FUSION", "1") != "0":
+        return self.tp._fasteq_plan.indexed(self.tp, x, y, weight, edge_index)
     message = self.tp(x[edge_index[0]], y, weight)
     return message.new_zeros((x.shape[0], self.irreps_out.dim)).index_add(
         0, edge_index[1], message
     )
+
+
+def _prophet_convolution(self, features, species, sh, radial_basis, senders,
+                        receivers, edge_envelope, *, _fasteq_fuse_norm=False):
+    if os.environ.get("FASTEQ_TP_GRAPH_FUSION", "1") == "0":
+        return self._fasteq_unfused_forward(
+            features, species, sh, radial_basis, senders, receivers,
+            edge_envelope, _fasteq_fuse_norm=_fasteq_fuse_norm,
+        )
+    messages = self.linear_1(features)
+    radial_message = self.radial_mlp(radial_basis)
+    messages_agg = self.tp._fasteq_plan.indexed(
+        self.tp, messages, sh, radial_message, (senders, receivers)
+    )
+    messages_agg = self.sort(messages_agg / math.sqrt(self.avg_n_neighbors))
+    skip = self.skip(species, features) if self.index_weights else self.skip(features)
+    projected = self.linear_2(messages_agg)
+    if _fasteq_fuse_norm and hasattr(self, "_fasteq_postprocess"):
+        return self._fasteq_postprocess(projected, skip)
+    features = projected + skip
+    if self.layer_norm is not None:
+        features = self.layer_norm(features)
+    return self.gate(features)
 
 
 def _gate(self, x):
@@ -199,6 +226,14 @@ def adapt_model(model, *, inplace=False):
             m._fasteq_equivariant = True
             backend = "FastEq native CUDA frame/rotary operations"
         else:
+            if cls == "TPConvolution" and module == "prophet.model":
+                # Preserve the original model method for controlled attribution
+                # and avoid changes to the upstream Prophet source/interface.
+                if not hasattr(m, "_fasteq_unfused_forward"):
+                    m._fasteq_unfused_forward = m.forward
+                m.forward = MethodType(_prophet_convolution, m)
+                report.append({"module": name, "operator": "IndexedTensorProductConv",
+                               "backend": "FastEq Uniform1D native gather/scatter fusion"})
             if cls in ("UuuTensorProduct", "UvuTensorProduct") and module.startswith(
                 "tace."
             ):

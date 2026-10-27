@@ -284,6 +284,8 @@ at::Tensor launch_fused_multipath_fctp_backward(
     return grad_a;
 }
 
+#include "fctp_shared.cuh"
+
 template<typename scalar_t, int U_TILE>
 __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     const scalar_t* __restrict__ b_all,        // [B,1,V]
@@ -380,12 +382,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
             int u_idx = u_base + u_off;   // 全局 u
 
             const size_t off = ((size_t)u_idx * V + (size_t)v) * W + (size_t)w0;
-            const Vec4 r = *reinterpret_cast<const Vec4*>(W_p + off);
-
-            sh_Wt[((size_t)w0 + 0) * U_pad + u_off] = (scalar_t)r.x;
-            sh_Wt[((size_t)w0 + 1) * U_pad + u_off] = (scalar_t)r.y;
-            sh_Wt[((size_t)w0 + 2) * U_pad + u_off] = (scalar_t)r.z;
-            sh_Wt[((size_t)w0 + 3) * U_pad + u_off] = (scalar_t)r.w;
+            fasteq_fctp::transpose_four(sh_Wt, U_pad, w0, u_off, W_p + off);
         }
         __syncthreads();
 

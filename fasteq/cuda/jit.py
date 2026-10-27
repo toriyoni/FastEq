@@ -31,6 +31,7 @@ def runtime():
     directory = Path(__file__).parent / "src"
     toolkit = Path(CUDA_HOME)
     sources = [directory / "jit_runtime.cpp"]
+    sources.append(directory / "native_gemm.cu")
     flags = ["-O3"]
     linear = directory / "indexed_linear_plan.cpp"
     if linear.exists():
@@ -48,12 +49,19 @@ def runtime():
     if segmented.exists():
         sources.append(segmented)
         flags.append("-DFASTEQ_SEGMENTED_PRODUCT")
+    fctp_sources = [directory / name for name in (
+        "fctp_general_matrix.cu", "fctp_general_features.cu", "fctp_general_plan.cpp"
+    )]
+    if all(path.exists() for path in fctp_sources):
+        sources.extend(fctp_sources)
+        flags.append("-DFASTEQ_FCTP_GENERAL")
     with _lock:
         return load(
             name="fasteq_cuda_jit",
             sources=[str(p) for p in sources],
             extra_include_paths=[str(directory), str(toolkit / "include")],
             extra_cflags=flags,
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "--fmad=true"],
             extra_ldflags=[
                 f"-L{toolkit / 'lib64'}",
                 f"-Wl,-rpath,{toolkit / 'lib64'}",
@@ -62,7 +70,7 @@ def runtime():
                 "-lcuda",
                 "-lc10_cuda",
             ],
-            with_cuda=False,
+            with_cuda=True,
             verbose=False,
         )
 
@@ -93,6 +101,18 @@ def _binary(source, options):
 def kernels(sources, device, entry="run"):
     """Return resident executables for source strings on one CUDA device."""
     device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("FastEq CUDA kernels require a CUDA device")
+    # Resolve the current-device alias before forming cache keys. Each resident
+    # Kernel owns a concrete CUDA context, even when the caller passes 'cuda'.
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    sources = tuple(sources)
+    keys = [(device, source, entry) for source in dict.fromkeys(sources)]
+    if keys and all(key in _loaded for key in keys):
+        # Kernel::launch restores its owning context. Hot calls need only the
+        # resident executable; arguments and current streams stay with callers.
+        return {source: _loaded[(device, source, entry)] for source in sources}
     with torch.cuda.device(device):
         major, minor = torch.cuda.get_device_capability(device)
         options = (
@@ -100,7 +120,6 @@ def kernels(sources, device, entry="run"):
             f"--gpu-architecture=sm_{major}{minor}",
             "--fmad=true",
         )
-        keys = [(device, source, entry) for source in dict.fromkeys(sources)]
         missing = [key for key in keys if key not in _loaded]
         if missing and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
