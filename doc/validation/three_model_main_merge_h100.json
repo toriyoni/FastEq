@@ -1,0 +1,798 @@
+{
+  "date": "2026-11-03",
+  "parent": "1babef8a2aaff9ee142527c2bc0c98915e47a1d2",
+  "upstream_main": "4463b10c1fa290f76bd2cbb8213a6e9377a34e78",
+  "branch": "codex/merge-main-tace-tece-prophet",
+  "initial_conflicts": [
+    "3rdparty/cuequivariance_torch",
+    "3rdparty/mace",
+    "fasteq/ops/fctp.py",
+    "fasteq/ops/stc_uniform1d_jit.py",
+    "fasteq/ops/uniform1d_auto_schedule.py",
+    "fasteq/ops/uniform1d_jit.py",
+    "fasteq/triton/__init__.py",
+    "fasteq/triton/fused_equivariant_gate.py",
+    "fasteq/triton/fused_equivariant_layer_norm.py",
+    "fasteq/triton/so3_linear.py",
+    "fasteq/triton/spherical_harmonics.py"
+  ],
+  "resolutions": [
+    {
+      "area": "Linear",
+      "resolution": "Preserve the adaptation native autograd and mul_ir serial forward/dX, which already extend main SO3 tiles; retain main public SO3 API via a compatibility import. Add legal-grid fallback to auto selection.",
+      "evidence": "performance/linear_backward_20261027/summary.json",
+      "reason": "One shared serial core, full dX/dW/higher derivatives and indexed/species coverage. Main kernel-only timings do not include the required layout conversion."
+    },
+    {
+      "area": "Uniform1D scheduler",
+      "resolution": "Use main modular auto_schedule and migrate output-resident split second adjoints. Preserve main selective first-gradient ABI, scalar CUDA warp reduction, and both native/Triton/Gluon entry points.",
+      "evidence": [
+        "uniform_performance.json",
+        "uniform_more_performance.json",
+        "uniform_threshold_performance.json",
+        "uniform_auto_validation.json"
+      ],
+      "reason": "Retain fused and output-resident split policies in one shared scheduler. H100 FP32 auto selects only measured 83-path layouts above measured thresholds; nine-path and unmeasured layouts retain main fused. Explicit 0/1 overrides preserved."
+    },
+    {
+      "area": "Autograd graph connectivity",
+      "resolution": "Save public inputs and recreate internal views under backward recording for Uniform1D and Gate.",
+      "evidence": "tests_cpu.log; tests_cuda.log",
+      "reason": "Upstream forward-created views lose the connection needed for force-loss derivatives."
+    },
+    {
+      "area": "STC",
+      "resolution": "Adopt main native grad_x0 and double backward, keep old import via stc.py, remove unconditional CUDA synchronization/timers.",
+      "evidence": "tests_merge_additional.log",
+      "reason": "Adds trainable-weight CUDA adjoints without introducing a second implementation."
+    },
+    {
+      "area": "FCTP legacy entry",
+      "resolution": "Adopt main fused Triton grad_w and double backward for the legacy public entry; retain original public inputs and omit unconditional synchronization/timers. The three-model native CUDA FCTP adapter is unchanged.",
+      "evidence": "tests_merge_additional.log",
+      "reason": "The old legacy wrapper did not provide grad_w; its lower latency is not a functionally equivalent baseline."
+    },
+    {
+      "area": "Gate/Norm/SH",
+      "resolution": "Keep existing measured native CUDA dispatch for adapted models, main public Triton APIs and local FP64/empty/batched-gradient fixes.",
+      "evidence": [
+        "performance/fasteq_optimization/v8/gate_invariants/SUMMARY.md",
+        "performance/fasteq_optimization/v8/norm_trial/FINAL.md",
+        "performance/fasteq_optimization/v8/sh/DISPATCH_SUMMARY.md"
+      ],
+      "reason": "Historical measurements support these domains, not a blanket native win. Prophet FP64 Gate was inconclusive; no general speed claim is made."
+    },
+    {
+      "area": "Tuning controls",
+      "resolution": "Honor per-call and environment controls plus main master switch; disabled tuning performs no timing/allocation.",
+      "evidence": "test_tuning_controls.log",
+      "reason": "Preserve prior callers that pass False and avoid unexpected multi-size tuning in model inference."
+    },
+    {
+      "area": "Packaging/imports",
+      "resolution": "Keep main build tooling and lazy Triton exports; let JIT/Triton work without the optional precompiled CUDA library. Package native sources.",
+      "evidence": "build_wheel.log",
+      "reason": "Main defaults to a Python-only build, so an unconditional .so import failure would break the merged installation."
+    },
+    {
+      "area": "Submodules",
+      "resolution": "Retain the tested cuequivariance_torch revision and registered MACE/SevenNet entries.",
+      "reason": "Avoid silently replacing the external baseline or removing still-used integrations."
+    },
+    {
+      "area": "Legacy optional tools",
+      "resolution": "Preserve the previously present TileLang prototype and CWTP metadata utility; neither is selected by the three-model runtime.",
+      "reason": "Main removed these files; retain existing import paths instead of silently deleting optional functionality. TileLang execution is outside this H100 CUDA validation."
+    }
+  ],
+  "runtime": {
+    "physical_gpu": 7,
+    "device": "NVIDIA H100 80GB HBM3",
+    "precision": "FP32 IEEE, TF32 disabled; FP64 for correctness",
+    "packages": {
+      "torch": "2.8.0",
+      "triton": "3.4.0",
+      "e3nn": "0.6.0",
+      "cuequivariance": "0.8.0",
+      "cuequivariance-torch": "0.8.0"
+    },
+    "cuda_toolkit": "12.8",
+    "model_timing": {
+      "atoms": 16384,
+      "neighbors": 12,
+      "channels": 64,
+      "layers": 2,
+      "lmax": 2,
+      "correlation": 2,
+      "warmup": 3,
+      "rounds": 9,
+      "iterations_per_round": 3,
+      "modes": [
+        "energy",
+        "energy_and_forces_without_create_graph"
+      ],
+      "exclude": [
+        "compilation",
+        "neighbor_construction"
+      ],
+      "gpu_sharing": "Reject samples if another GPU compute process is present."
+    }
+  },
+  "validation_scope": "H100 GPU7, affected operator FP32/FP64 and three-model energy/force/force-loss correctness; targeted timing, no repeat OOM scan. HIP and other GPUs not validated.",
+  "tests_completed": {
+    "linear_existing": 19,
+    "uniform_layouts": 3,
+    "gate_sh": 24,
+    "norm": 27,
+    "model_cases": 6,
+    "public_autograd_cpu": 28,
+    "split_codegen_cpu": 14,
+    "optional_backend_codegen_cpu": 14,
+    "tuning_controls_cpu": 1,
+    "merge_cuda_boundaries": 10,
+    "total": 150,
+    "double_policy_cpu": 4
+  },
+  "model_correctness": {
+    "prophet_float32": {
+      "model": "prophet",
+      "dtype": "torch.float32",
+      "max_abs_errors": {
+        "energy": 2.384185791015625e-07,
+        "forces": 2.1457672119140625e-06
+      },
+      "max_parameter_gradient_abs_error": 0.0006103515625,
+      "parameter_gradient_relative_l2_error": 3.921665978850481e-07
+    },
+    "prophet_float64": {
+      "model": "prophet",
+      "dtype": "torch.float64",
+      "max_abs_errors": {
+        "energy": 7.216449660063518e-16,
+        "forces": 2.4424906541753444e-15
+      },
+      "max_parameter_gradient_abs_error": 4.774847184307873e-12,
+      "parameter_gradient_relative_l2_error": 3.5249125696575384e-15
+    },
+    "tace_float32": {
+      "model": "tace",
+      "dtype": "torch.float32",
+      "max_abs_errors": {
+        "energy": 2.9802322387695312e-08,
+        "forces": 3.2782554626464844e-07,
+        "stress": 6.402842700481415e-10,
+        "virials": 3.2782554626464844e-07
+      },
+      "max_parameter_gradient_abs_error": 1.1444091796875e-05,
+      "parameter_gradient_relative_l2_error": 1.4715109670564184e-06
+    },
+    "tace_float64": {
+      "model": "tace",
+      "dtype": "torch.float64",
+      "max_abs_errors": {
+        "energy": 5.551115123125783e-17,
+        "forces": 4.163336342344337e-16,
+        "stress": 7.589415207398531e-19,
+        "virials": 3.885780586188048e-16
+      },
+      "max_parameter_gradient_abs_error": 1.5987211554602254e-14,
+      "parameter_gradient_relative_l2_error": 2.2639377822343095e-15
+    },
+    "tece_float32": {
+      "model": "tece",
+      "dtype": "torch.float32",
+      "max_abs_errors": {
+        "energy": 4.76837158203125e-07,
+        "forces": 1.9073486328125e-06,
+        "stress": 1.862645149230957e-09,
+        "virials": 9.5367431640625e-07
+      },
+      "max_parameter_gradient_abs_error": 0.0010986328125,
+      "parameter_gradient_relative_l2_error": 4.844754275584214e-07
+    },
+    "tece_float64": {
+      "model": "tece",
+      "dtype": "torch.float64",
+      "max_abs_errors": {
+        "energy": 8.881784197001252e-16,
+        "forces": 8.881784197001252e-15,
+        "stress": 1.5612511283791264e-17,
+        "virials": 7.993605777301127e-15
+      },
+      "max_parameter_gradient_abs_error": 2.5011104298755527e-12,
+      "parameter_gradient_relative_l2_error": 1.1952476410525784e-15
+    }
+  },
+  "double_backward_selection": {
+    "default": "auto",
+    "measured_scope": "NVIDIA H100, FP32, C64; only the two matched 83-path descriptors get automatic split selection",
+    "profiles": [
+      {
+        "mode": "u,u,,u",
+        "dims": [
+          11,
+          9,
+          9,
+          35
+        ],
+        "need_grad": [
+          true,
+          true,
+          true
+        ],
+        "gather_x": true,
+        "scatter": true,
+        "shared_w": false,
+        "minimum_nodes": 1024,
+        "selected": "split"
+      },
+      {
+        "mode": "u,u,u,u",
+        "dims": [
+          1,
+          9,
+          9,
+          35
+        ],
+        "need_grad": [
+          false,
+          true,
+          true
+        ],
+        "gather_x": false,
+        "scatter": false,
+        "shared_w": true,
+        "minimum_rows": 2048,
+        "selected": "split"
+      }
+    ],
+    "otherwise": "main fused",
+    "override": "FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT=0 or 1 still forces the old choices; unset or auto enables measured selection. Replace old blanket value 1 with auto for the merged configuration."
+  },
+  "historical_evidence": [
+    {
+      "source": "performance/linear_backward_20261027/summary.json",
+      "metric": "Energy + force inference, no second derivative",
+      "rows": [
+        {
+          "model": "tace",
+          "atoms": 131072,
+          "before_ms": 123.7716,
+          "optimized_ms": 117.335
+        },
+        {
+          "model": "prophet",
+          "atoms": 262144,
+          "before_ms": 294.0006,
+          "optimized_ms": 246.821
+        }
+      ],
+      "use": "Preserve already measured native Linear dX. This is historical evidence, not the new merge timing."
+    },
+    {
+      "source": "performance/fasteq_optimization/v8/norm_trial/FINAL.md",
+      "metric": "Native vs shared Triton, N4096 C64; forward/backward/higher",
+      "speedups": {
+        "tace_fp32": [
+          1.037,
+          1.1,
+          1.091
+        ],
+        "prophet_fp32": [
+          1.114,
+          1.115,
+          1.098
+        ],
+        "tace_fp64": [
+          1.114,
+          1.124,
+          1.006
+        ],
+        "prophet_fp64": [
+          1.061,
+          1.12,
+          1.05
+        ]
+      },
+      "use": "Retain existing native dispatch. Higher derivative FP64 TACE is approximately tied."
+    },
+    {
+      "source": "performance/fasteq_optimization/v8/sh/DISPATCH_SUMMARY.md",
+      "metric": "Forward + backward + double backward, N49152",
+      "speedups": {
+        "fp32": 1.126,
+        "fp64": 1.108
+      },
+      "use": "Retain existing native dispatch."
+    },
+    {
+      "source": "performance/fasteq_optimization/v8/gate_invariants/SUMMARY.md",
+      "metric": "Forward + backward + double backward",
+      "speedups": {
+        "o2_fp32": 1.043,
+        "o2_fp64": 1.124,
+        "o3_fp32": 1.114,
+        "o3_fp64": 1.321,
+        "prophet_fp32": 1.179
+      },
+      "use": "Retain tested dispatch. Prophet FP64 is statistically inconclusive; no speed claim."
+    }
+  ],
+  "retention": {
+    "unchanged_existing_native_adapter_operator_files": 75,
+    "original_branch_untouched": true,
+    "compatibility_entries": [
+      "fasteq.ops.stc",
+      "fasteq.ops.equi_linear"
+    ],
+    "optional_legacy_files_retained": [
+      "fasteq/tilelang/uniform1d.py",
+      "fasteq/tools/gen_cwtp_fwd.py"
+    ],
+    "submodules_retained": [
+      "3rdparty/cuequivariance_torch",
+      "3rdparty/mace",
+      "3rdparty/SevenNet"
+    ]
+  },
+  "inference_timing_note": "All six end-to-end timings completed before the final measured double-backward dispatch was added. That selector is not invoked by either tested mode (energy or energy+forces with create_graph=False); inference code/kernels are unchanged. Pre-selector source snapshot is wheel_final_install/fasteq.",
+  "status": "validated",
+  "purpose": "Merge upstream main into the existing optimized TACE/TECE/Prophet integration without removing model features; select equivalent implementations using measured latency.",
+  "end_to_end": [
+    {
+      "model": "prophet",
+      "atoms": 16384,
+      "mode": "energy",
+      "parent_ms": 8.431720663793385,
+      "merged_ms": 8.346262310321132,
+      "speedup": 1.0102391166602294,
+      "errors": {
+        "energy": {
+          "max_abs": 5.066394805908203e-07,
+          "relative_l2": 5.341804947650473e-07
+        }
+      }
+    },
+    {
+      "model": "prophet",
+      "atoms": 16384,
+      "mode": "forces",
+      "parent_ms": 21.161879684465628,
+      "merged_ms": 20.374980638734996,
+      "speedup": 1.0386208487597113,
+      "errors": {
+        "energy": {
+          "max_abs": 5.066394805908203e-07,
+          "relative_l2": 5.336784082583553e-07
+        },
+        "forces": {
+          "max_abs": 5.7220458984375e-06,
+          "relative_l2": 6.010470544210152e-07
+        }
+      }
+    },
+    {
+      "model": "tace",
+      "atoms": 16384,
+      "mode": "energy",
+      "parent_ms": 7.1495636366307735,
+      "merged_ms": 7.131237342643241,
+      "speedup": 1.0025698617374499,
+      "errors": {
+        "energy": {
+          "max_abs": 0.00146484375,
+          "relative_l2": 4.5541602367616825e-07
+        }
+      }
+    },
+    {
+      "model": "tace",
+      "atoms": 16384,
+      "mode": "forces",
+      "parent_ms": 17.101209339064855,
+      "merged_ms": 16.88355867130061,
+      "speedup": 1.0128912791433133,
+      "errors": {
+        "energy": {
+          "max_abs": 0.006103515625,
+          "relative_l2": 1.8975631645645714e-06
+        },
+        "forces": {
+          "max_abs": 1.52587890625e-05,
+          "relative_l2": 5.275059534732311e-07
+        }
+      }
+    },
+    {
+      "model": "tece",
+      "atoms": 16384,
+      "mode": "energy",
+      "parent_ms": 26.656257997577388,
+      "merged_ms": 26.88896601709227,
+      "speedup": 0.9913455943465079,
+      "errors": {
+        "energy": {
+          "max_abs": 0.0009765625,
+          "relative_l2": 1.57745812341638e-07
+        }
+      }
+    },
+    {
+      "model": "tece",
+      "atoms": 16384,
+      "mode": "forces",
+      "parent_ms": 67.26724402202915,
+      "merged_ms": 66.92447664681822,
+      "speedup": 1.005121704231171,
+      "errors": {
+        "energy": {
+          "max_abs": 0.00390625,
+          "relative_l2": 6.309845930914443e-07
+        },
+        "forces": {
+          "max_abs": 3.719329833984375e-05,
+          "relative_l2": 1.0049091645158355e-06
+        }
+      }
+    }
+  ],
+  "operator_second_adjoint_comparison": [
+    {
+      "fixture": "first_layer_9_paths",
+      "nodes": 1024,
+      "paths": 9,
+      "fused_ms": {
+        "median": 0.0581055998802185,
+        "q25": 0.05790079832077026,
+        "q75": 0.05883520245552063,
+        "min": 0.057004797458648684,
+        "max": 0.06323199868202209
+      },
+      "split_ms": {
+        "median": 0.08435199856758117,
+        "q25": 0.08402559757232667,
+        "q75": 0.08473600149154663,
+        "min": 0.08361600041389465,
+        "max": 0.085971200466156
+      },
+      "split_speedup": 0.6888467477586252,
+      "outputs_max_abs_error": [
+        5.960464477539063e-08,
+        0.0,
+        2.384185791015625e-07,
+        5.960464477539063e-08
+      ]
+    },
+    {
+      "fixture": "first_layer_9_paths",
+      "nodes": 16384,
+      "paths": 9,
+      "fused_ms": {
+        "median": 1.0569664001464845,
+        "q25": 1.0564543724060058,
+        "q75": 1.058463954925537,
+        "min": 1.0554368019104003,
+        "max": 1.1105600357055665
+      },
+      "split_ms": {
+        "median": 1.5944704055786132,
+        "q25": 1.59367036819458,
+        "q75": 1.595206356048584,
+        "min": 1.5930047988891602,
+        "max": 1.6118528366088867
+      },
+      "split_speedup": 0.6628949627716199,
+      "outputs_max_abs_error": [
+        2.9802322387695312e-08,
+        0.0,
+        4.76837158203125e-07,
+        8.940696716308594e-08
+      ]
+    },
+    {
+      "fixture": "tace_layer2",
+      "nodes": 1024,
+      "paths": 83,
+      "fused_ms": {
+        "median": 0.6018239974975585,
+        "q25": 0.6003583908081055,
+        "q75": 0.6030272006988525,
+        "min": 0.5998464107513428,
+        "max": 0.6106368064880371
+      },
+      "split_ms": {
+        "median": 0.22780160903930663,
+        "q25": 0.2275775909423828,
+        "q75": 0.2290560007095337,
+        "min": 0.22697598934173585,
+        "max": 0.23422720432281494
+      },
+      "split_speedup": 2.641877728764046,
+      "outputs_max_abs_error": [
+        1.341104507446289e-07,
+        4.470348358154297e-08,
+        2.682209014892578e-07,
+        2.384185791015625e-07
+      ]
+    },
+    {
+      "fixture": "tace_layer2",
+      "nodes": 16384,
+      "paths": 83,
+      "fused_ms": {
+        "median": 11.033241271972656,
+        "q25": 11.029503631591798,
+        "q75": 11.056985473632812,
+        "min": 11.026771545410156,
+        "max": 11.06569595336914
+      },
+      "split_ms": {
+        "median": 5.977836990356446,
+        "q25": 5.974822235107422,
+        "q75": 5.987648010253906,
+        "min": 5.973132705688476,
+        "max": 5.997484970092773
+      },
+      "split_speedup": 1.84569122406176,
+      "outputs_max_abs_error": [
+        1.4901161193847656e-07,
+        8.940696716308594e-08,
+        4.172325134277344e-07,
+        2.980232238769531e-07
+      ]
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 1024,
+      "paths": 83,
+      "fused_ms": {
+        "median": 0.04586879909038544,
+        "q25": 0.044012799859046936,
+        "q75": 0.2066175937652588,
+        "min": 0.04318079948425293,
+        "max": 0.22931199073791503
+      },
+      "split_ms": {
+        "median": 0.04769920110702515,
+        "q25": 0.04688639938831329,
+        "q75": 0.12845439910888673,
+        "min": 0.04455040097236633,
+        "max": 0.19187840223312377
+      },
+      "split_speedup": 0.9616261494079797,
+      "outputs_max_abs_error": [
+        1.4901161193847656e-08,
+        2.9802322387695312e-08,
+        4.470348358154297e-08
+      ]
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 16384,
+      "paths": 83,
+      "fused_ms": {
+        "median": 0.5775424003601074,
+        "q25": 0.5774271965026856,
+        "q75": 0.5779391765594483,
+        "min": 0.5766719818115235,
+        "max": 0.6089216232299804
+      },
+      "split_ms": {
+        "median": 0.34828159809112547,
+        "q25": 0.3478271961212158,
+        "q75": 0.3485759973526001,
+        "min": 0.34751999378204346,
+        "max": 0.35199999809265137
+      },
+      "split_speedup": 1.6582627492394744,
+      "outputs_max_abs_error": [
+        2.9802322387695312e-08,
+        4.470348358154297e-08,
+        4.470348358154297e-08
+      ]
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 2048,
+      "paths": 83,
+      "fused_ms": {
+        "median": 0.08954240083694458,
+        "q25": 0.08820480108261108,
+        "q75": 0.0945792019367218,
+        "min": 0.08698880076408386,
+        "max": 0.10832639932632446
+      },
+      "split_ms": {
+        "median": 0.0662335991859436,
+        "q25": 0.06389120221138,
+        "q75": 0.09155200123786926,
+        "min": 0.06287999749183655,
+        "max": 0.1463104009628296
+      },
+      "split_speedup": 1.3519180889681695,
+      "outputs_max_abs_error": [
+        1.4901161193847656e-08,
+        2.9802322387695312e-08,
+        2.9802322387695312e-08
+      ]
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 4096,
+      "paths": 83,
+      "fused_ms": {
+        "median": 0.16272640228271484,
+        "q25": 0.16225919723510743,
+        "q75": 0.16311039924621581,
+        "min": 0.16180479526519775,
+        "max": 0.17601920366287233
+      },
+      "split_ms": {
+        "median": 0.1108672022819519,
+        "q25": 0.11038719415664673,
+        "q75": 0.11179519891738891,
+        "min": 0.11033600568771362,
+        "max": 0.11354240179061889
+      },
+      "split_speedup": 1.4677596163099456,
+      "outputs_max_abs_error": [
+        2.2351741790771484e-08,
+        5.960464477539063e-08,
+        4.470348358154297e-08
+      ]
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 8192,
+      "paths": 83,
+      "fused_ms": {
+        "median": 0.30202879905700686,
+        "q25": 0.3015104055404663,
+        "q75": 0.34584319591522217,
+        "min": 0.2992959976196289,
+        "max": 0.37569921016693114
+      },
+      "split_ms": {
+        "median": 0.19730559587478638,
+        "q25": 0.1919808030128479,
+        "q75": 0.19813120365142822,
+        "min": 0.1913599967956543,
+        "max": 0.21765758991241455
+      },
+      "split_speedup": 1.53076651332626,
+      "outputs_max_abs_error": [
+        1.4901161193847656e-08,
+        2.9802322387695312e-08,
+        4.470348358154297e-08
+      ]
+    }
+  ],
+  "auto_dispatch_checks": [
+    {
+      "fixture": "tace_layer2",
+      "nodes": 1023,
+      "selected_split": false,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_layer2",
+      "nodes": 1024,
+      "selected_split": true,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_layer2",
+      "nodes": 2047,
+      "selected_split": true,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_layer2",
+      "nodes": 2048,
+      "selected_split": true,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_layer2",
+      "nodes": 16384,
+      "selected_split": true,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 1023,
+      "selected_split": false,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 1024,
+      "selected_split": false,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 2047,
+      "selected_split": false,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 2048,
+      "selected_split": true,
+      "output_parity": "passed"
+    },
+    {
+      "fixture": "tace_ace",
+      "nodes": 16384,
+      "selected_split": true,
+      "output_parity": "passed"
+    }
+  ],
+  "packaging": {
+    "wheel": "fasteq-0.3.0-py3-none-any.whl",
+    "sha256": "a7e1e8aee67567a4f907e5ba14f1ec63a01ead93f19015300f77f52796f91f77",
+    "entries": 183,
+    "verified_source_entries": 178,
+    "precompiled_binary_count": 0,
+    "result": "passed"
+  },
+  "recommended_h100_fp32_flags": {
+    "FASTEQ_BACKEND": "cuda",
+    "FASTEQ_EXPERIMENTAL_LINEAR_SIMT": "1",
+    "FASTEQ_EXPERIMENTAL_NATIVE_MODULATION": "1",
+    "FASTEQ_UNIFORM1D_FWD_TUNE": "0",
+    "FASTEQ_UNIFORM1D_BWD_TUNE": "0",
+    "FASTEQ_EXPERIMENTAL_LINEAR_GEMM": "1",
+    "FASTEQ_EXPERIMENTAL_SEGMENTED_TASK_MASK": "1",
+    "FASTEQ_EXPERIMENTAL_SEGMENTED_REDUCE": "1",
+    "FASTEQ_EXPERIMENTAL_SEGMENTED_GEMM": "1",
+    "FASTEQ_EXPERIMENTAL_SEGMENTED_PAIR": "1",
+    "FASTEQ_EXPERIMENTAL_SEGMENTED_NATIVE_FUSION": "1",
+    "FASTEQ_EXPERIMENTAL_FCTP_FUSED": "1",
+    "FASTEQ_EXPERIMENTAL_FCTP_F32_F64MMA": "1",
+    "FASTEQ_EXPERIMENTAL_MATRIX_F32_F64MMA": "1",
+    "FASTEQ_EXPERIMENTAL_UNIFORM_SCALAR_Y": "1",
+    "FASTEQ_EXPERIMENTAL_UNIFORM_SCALAR_Y_WARP": "1",
+    "FASTEQ_EXPERIMENTAL_WIGNER_STORE_TILE": "1",
+    "FASTEQ_EXPERIMENTAL_LOCAL_SPLIT_VIEW": "1",
+    "FASTEQ_EXPERIMENTAL_MATRIX_TF32X3": "0",
+    "FASTEQ_TP_GRAPH_FUSION": "1",
+    "FASTEQ_EXPERIMENTAL_LINEAR_WGMMA": "1",
+    "FASTEQ_EXPERIMENTAL_LINEAR_INDEXED_TILES": "1",
+    "FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT": "auto",
+    "FASTEQ_EXPERIMENTAL_U1D_SCALAR_REDUCE": "1",
+    "FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE": "0",
+    "FASTEQ_CODEGEN_BACKEND": "cuda"
+  },
+  "test_execution_notes": {
+    "public_autograd_cpu": "28 all nonempty requires_grad masks, scalar/vector Y, shared/per-edge weight cases; exact PyTorch algebra; first and second derivatives.",
+    "codegen_cpu": "14 CUDA split-output masks and 14 Triton/Gluon fused-output code generation cases; one tuning-control regression.",
+    "cuda_existing": "19 Linear cases in initial batch; 3 Uniform1D layouts/tails, 24 Gate/SH, 27 Norm, 6 model cases in subsequent batch.",
+    "cuda_merge": "6 FP64 partial-gradient/split cases, 2 STC trainable-weight cases, 1 legacy FCTP mixed derivative, 1 SO3 large-grid/cached-choice case.",
+    "model_tolerances": {
+      "fp32_outputs": {
+        "atol": 3e-05,
+        "rtol": 0.0003
+      },
+      "fp64_outputs": {
+        "atol": 2e-08,
+        "rtol": 2e-07
+      },
+      "parameter_gradients": "10x output tolerance"
+    },
+    "batch_restart": "The old test process was stopped after its 60 operator/model cases completed, because its loaded additional test still enabled unused candidate compilation. A compiler interruption in that unfinished case is not treated as an accuracy result; all ten additional cases run in a fresh process.",
+    "linear_initial_batch": "Initial log has 19 completed Linear cases before switching the remaining test queue to corrected tuning controls."
+  },
+  "evidence_location": "Local raw logs, samples, source snapshots, build outputs and comparison scripts: tace_prophet_fasteq/performance/main_merge_20261103/ (outside this repository).",
+  "reviewed_source_sha256": {
+    "fasteq/ops/uniform1d_jit.py": "235976a27784c50a1ab445b7c039e252c0c3510318550e38662907cedeaf68d5",
+    "fasteq/ops/auto_schedule/models.py": "2e3194a8ca026ddcfb9650da9653691aac577a96334549b0542db86318df5478",
+    "fasteq/ops/auto_schedule/schedulers.py": "9d3956aae5ce1a7529917f7d36dfc6c93bcc3fc316a097e879f214ce09c09e8c",
+    "fasteq/ops/auto_schedule/uniform1d_double_backward.py": "6f6ff566823481b22c5bfb2552bec4e6c06fef9cf9bc8e86116cb1d1003ae9e8",
+    "fasteq/ops/stc_uniform1d_jit.py": "1a9e6cbd075738b9e816d9da2ad19543d05dcf3cff897a30c0d258a1ee0c1add",
+    "fasteq/ops/fctp.py": "ec175369cebdf5ad03f73dd5e1d0fdd87129bf28ac21f867e29c0cd2c8c42788",
+    "fasteq/triton/so3_linear.py": "185c2df706b8cefb87c841d6986acf7d2d1475aa357d1496cae0982539b60c19",
+    "tests/adapters/test_main_merge.py": "d356fc62608607b45cb28b6272ec6f53b88ea1b36b408d10145e5582f3539fe9"
+  }
+}

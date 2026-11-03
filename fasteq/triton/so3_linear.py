@@ -779,7 +779,15 @@ def so3_linear_auto(w, x, layout, *, tf32=False, benchmark_warmup=10,
         'path_parallel': so3_linear_path_parallel,
         'group_parallel': so3_linear_group_parallel,
     }
+    # Main's parallel variants tile rows on grid Y (limited to 65535).
+    # Keep the serial implementation available for large atom counts, including
+    # when a previous, smaller call cached a parallel implementation.
+    max_i = max((i for i, _ in layout.output_segments), default=1)
+    if triton.cdiv(x.shape[0] * max_i, 32) > 65535:
+        implementations = {'serial': so3_linear_serial_cta}
     selected = modes.get(effective_tf32)
+    if selected is not None and selected not in implementations:
+        selected = 'serial'
     if selected is None:
         timings = {}
         for name, implementation in implementations.items():

@@ -4,7 +4,7 @@ import json
 import sys
 import shutil
 import hashlib
-import tempfile
+import weakref
 import traceback
 import re
 import io
@@ -20,14 +20,100 @@ import torch
 import torch._dynamo
 from torch.utils.cpp_extension import load
 
+
 from .uniform1d_auto_schedule import (
     generate_code_uniform1d_fwd_with_scheduler,
     generate_code_uniform1d_bwd_with_scheduler,
     generate_code_uniform1d_double_bwd_with_scheduler,
     generate_code_uniform1d_fwd_baseline_unrolled,
     generate_code_uniform1d_bwd_baseline_unrolled,
+    build_triton_uniform1d_fwd_module,
+    build_triton_uniform1d_bwd_module,
+    build_triton_uniform1d_double_bwd_module,
 
 )
+
+
+from .auto_schedule.multi_size_tuning import (
+    benchmark_sizes as _benchmark_sizes,
+    make_case_factory as _make_case_factory,
+    policy_signature as _tuning_policy_signature,
+    tuning_sizes as _tuning_sizes,
+)
+
+
+# Python GPU module caches. Keys include backend and generated configuration.
+# CUDA/HIP remains the default backend.
+_TRITON_FWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
+_TRITON_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
+_TRITON_DOUBLE_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
+_PYTHON_METADATA_CONTENT_CACHE: Dict[int, tuple] = {}
+
+
+def _fasteq_codegen_backend() -> str:
+    backend = os.environ.get("FASTEQ_CODEGEN_BACKEND", "cuda").strip().lower()
+    if backend in ("cuda", "hip", "cpp", "native"):
+        return "native"
+    if backend in ("triton", "gluon"):
+        return backend
+    raise ValueError(
+        f"Unsupported FASTEQ_CODEGEN_BACKEND={backend!r}; expected cuda/native, triton, or gluon"
+    )
+
+def _python_codegen_builder(backend: str, phase: str):
+    """Resolve Gluon lazily so native/Triton do not require Gluon imports."""
+    if backend == "triton":
+        return {
+            "fwd": build_triton_uniform1d_fwd_module,
+            "bwd": build_triton_uniform1d_bwd_module,
+            "double_bwd": build_triton_uniform1d_double_bwd_module,
+        }[phase]
+    if backend == "gluon":
+        from .auto_schedule.gluon_backend import (
+            build_gluon_uniform1d_fwd_module,
+            build_gluon_uniform1d_bwd_module,
+            build_gluon_uniform1d_double_bwd_module,
+        )
+        return {
+            "fwd": build_gluon_uniform1d_fwd_module,
+            "bwd": build_gluon_uniform1d_bwd_module,
+            "double_bwd": build_gluon_uniform1d_double_bwd_module,
+        }[phase]
+    raise ValueError(f"Not a Python codegen backend: {backend!r}")
+
+
+def _python_codegen_options(backend: str, phase: str):
+    """Explicit settings pin candidate dimensions; unspecified settings are tuned."""
+    if backend not in ('triton','gluon'):
+        raise ValueError(f'Not a Python codegen backend: {backend!r}')
+    env_name = 'FASTEQ_GLUON_OPTIONS' if backend == 'gluon' else 'FASTEQ_TRITON_OPTIONS'
+    try: options = json.loads(os.environ.get(env_name,'{}') or '{}')
+    except ValueError as exc: raise ValueError(f'{env_name} must be a JSON object') from exc
+    if not isinstance(options,dict): raise ValueError(f'{env_name} must be a JSON object')
+    allowed = {'block_u','num_warps','backward_mode','channel_chunk'}
+    if backend == 'gluon': allowed |= {'placement_config','shared_inputs','preserve_shared','scheduler_options'}
+    unknown=set(options)-allowed
+    if unknown: raise ValueError(f'{env_name} unknown keys: {sorted(unknown)}')
+    for name in ('block_u','num_warps','channel_chunk'):
+        if name not in options: continue
+        v=options[name]
+        if isinstance(v,bool) or not isinstance(v,int) or v<1 or v&(v-1):
+            raise ValueError(f'{env_name} {name} must be a positive power of two')
+    if options.get('num_warps',4)>32: raise ValueError(f'{env_name} num_warps cannot exceed 32')
+    if 'backward_mode' in options and options['backward_mode'] not in ('split','fused'):
+        raise ValueError(f'{env_name} backward_mode must be split or fused')
+    for name in ('placement_config','scheduler_options'):
+        if options.get(name) is not None and not isinstance(options[name],dict):
+            raise ValueError(f'{env_name} {name} must be an object or null')
+    if 'shared_inputs' in options and (not isinstance(options['shared_inputs'],list) or not all(isinstance(r,str) for r in options['shared_inputs'])):
+        raise ValueError(f'{env_name} shared_inputs must be a list of strings')
+    if 'preserve_shared' in options and not isinstance(options['preserve_shared'],bool):
+        raise ValueError(f'{env_name} preserve_shared must be boolean')
+    if phase != 'bwd':
+        options.pop('backward_mode',None);options.pop('channel_chunk',None)
+    if phase == 'double_bwd':options.pop('placement_config',None)
+    return options,json.dumps(options,sort_keys=True,separators=(',',':'))
+
 
 # -----------------------------------------------------------------------------
 # JIT cache
@@ -52,25 +138,20 @@ _DOUBLE_BWD_TUNE_KEY_FAST_CACHE: Dict[Tuple[Any, ...], str] = {}
 # Avoid repeating expensive disk cleanup / source pruning on every hot-path call.
 _JIT_PRUNE_DONE_CACHE: Set[Tuple[str, str, str]] = set()
 
-# Cache int32 copies of immutable path metadata tensors.  If meta stores int64
-# tensors, calling .to(torch.int32) in every forward creates fresh tensors and
-# breaks the fast build-cache identity key.
 _META_INT32_TENSOR_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
 
 
 # -----------------------------------------------------------------------------
 # Default auto-warp tuning policy
 # -----------------------------------------------------------------------------
-# Normal callers do not need to set warp/register-capacity environment variables.
-# Warp size and register-file capacity are read from torch CUDA/HIP runtime device
-# properties.  The maximum tested warps/block is derived after compiling the
-# 1-warp candidate and parsing its compiler-reported registers/thread.
 _DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = True
 _DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = True
 _DEFAULT_UNIFORM1D_TUNE_WARMUP = 3
 _DEFAULT_UNIFORM1D_TUNE_REPEAT = 10
-# Generate and benchmark w2/w3/... candidates in addition to the mandatory w1 candidate.
-_DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED = True
+# Shared by Uniform1D and STC. Set once before model execution.
+# False: one base implementation, no variant search or benchmarking.
+# True: generate multi-warp variants and select by benchmark.
+ENABLE_JIT_CANDIDATES = True
 
 # Fallbacks are used only when importing or smoke-testing without a visible GPU.
 # Normal runtime tuning obtains these values from torch.cuda.get_device_properties().
@@ -96,19 +177,40 @@ def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
         return max(int(min_value), int(default))
 
 
-def _resolve_multiwarp_candidates_enabled(value: Optional[bool]) -> bool:
-    """Resolve the per-call multi-warp candidate switch.
-
-    A non-None function argument has priority.  When it is None, the environment
-    variable keeps command-line experimentation convenient without changing the
-    operator call site.
-    """
+def _resolve_multiwarp_candidates_enabled(value: Optional[bool] = None) -> bool:
+    """Keep main's master switch and the adapters' per-call/env overrides."""
+    if not ENABLE_JIT_CANDIDATES:
+        return False
     if value is not None:
         return bool(value)
-    return _env_bool(
-        "FASTEQ_UNIFORM1D_MULTI_WARP_CANDIDATES",
-        _DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED,
-    )
+    return _env_bool("FASTEQ_UNIFORM1D_MULTI_WARP_CANDIDATES", True)
+
+
+def _resolve_double_split_enabled(*, w, x, grad_out, mode, u_dim, dims,
+                                  paths, grad_flags, index_flags) -> bool:
+    """Use measured H100 choices; explicit 0/1 retain the legacy overrides.
+
+    Unmeasured layouts/devices keep main's fused implementation. On H100 FP32
+    C64, the 83-path graph product benefits from splitting at 1024 nodes; the
+    shared-weight dense ACE product crosses over at 2048 rows. Nine-path
+    products retain the fused implementation. No runtime timing is performed.
+    """
+    setting = os.environ.get("FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT", "auto")
+    if setting.strip().lower() != "auto":
+        return _env_bool("FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT", False)
+    if (w.dtype != torch.float32 or w.device.type != "cuda"
+            or torch.version.hip is not None or u_dim != 64 or paths != 83):
+        return False
+    profiles = {
+        ("u,u,,u", (11, 9, 9, 35), (True, True, True), (True, False, True), False): 1024,
+        ("u,u,u,u", (1, 9, 9, 35), (False, True, True), (False, False, False), True): 2048,
+    }
+    minimum = profiles.get((mode, tuple(dims), tuple(grad_flags),
+                            tuple(index_flags), w.shape[0] == 1))
+    if minimum is None or min(x.shape[0], grad_out.shape[0]) < minimum:
+        return False
+    props = torch.cuda.get_device_properties(w.device)
+    return (props.major, props.minor) == (9, 0) and "H100" in props.name
 
 
 def _runtime_device_properties():
@@ -167,18 +269,6 @@ def _autowarp_runtime_policy() -> Tuple[int, int, int]:
 
 
 def _format_cuda_arch_list_from_runtime() -> Optional[str]:
-    """Return a TORCH_CUDA_ARCH_LIST string using the parent process runtime.
-
-    torch.utils.cpp_extension.load() calls _get_cuda_arch_flags().  When
-    TORCH_CUDA_ARCH_LIST is unset, PyTorch queries torch.cuda.get_device_capability()
-    inside the process that performs compilation.  That is unsafe in a forked
-    worker after the parent has initialized CUDA and causes:
-
-        RuntimeError: Cannot re-initialize CUDA in forked subprocess
-
-    Therefore the parent process should materialize the arch list once and pass
-    it to compile workers through the environment.
-    """
     try:
         if not torch.cuda.is_available():
             return None
@@ -358,11 +448,6 @@ def _find_fasteq_root(start: Path) -> Path:
     raise RuntimeError("Cannot find fasteq project root from __file__")
 
 
-
-from pathlib import Path
-import torch
-
-
 def _detect_gpu_backend() -> str:
     """Return the build backend without forcing CUDA/HIP runtime init.
 
@@ -376,8 +461,6 @@ def _detect_gpu_backend() -> str:
     if getattr(torch.version, "cuda", None):
         return "cuda"
 
-    # Last-resort fallback for unusual builds.  This branch may initialize the
-    # runtime, so normal CUDA/HIP builds should not reach it.
     if not torch.cuda.is_available():
         raise RuntimeError("No CUDA/HIP GPU is available.")
 
@@ -392,12 +475,28 @@ def _detect_gpu_backend() -> str:
 def _default_build_root() -> Path:
     backend = _detect_gpu_backend()
 
-    root = (
-        _find_fasteq_root(Path(__file__).parent)
-        / backend
-        / "src"
-        / "uniform1d_jit_codegen"
+    env_root = os.environ.get("FASTEQ_JIT_CACHE_DIR", "").strip()
+    if env_root:
+        cache_root = Path(env_root).expanduser()
+    else:
+        xdg_cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+        cache_root = (
+            Path(xdg_cache_home).expanduser()
+            if xdg_cache_home
+            else Path.home() / ".cache"
+        ) / "fasteq"
+
+    runtime_version = (
+        getattr(torch.version, "hip", None)
+        or getattr(torch.version, "cuda", None)
+        or "unknown"
     )
+    runtime_version = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(runtime_version))
+    abi_key = (
+        f"py{sys.version_info.major}{sys.version_info.minor}_"
+        f"{backend}{runtime_version}"
+    )
+    root = cache_root / abi_key / "uniform1d_jit_codegen"
 
     _ensure_dir(root)
     return root
@@ -405,7 +504,7 @@ def _default_build_root() -> Path:
 
 def _default_src_path() -> Path:
     backend = _detect_gpu_backend()
-    
+
     root = _find_fasteq_root(Path(__file__).parent) / backend / "src"
     _ensure_dir(root)
     return root
@@ -586,7 +685,7 @@ def _load_jit_module(
             name=module_name,
             sources=[str(cu_path)],
             extra_cflags=extra_cflags or ["-O3"],
-            extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--ptxas-options=-v"],
+            extra_cuda_cflags=extra_cuda_cflags or ["-O3"],
             #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
             #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--offload-arch=gfx936"],
             extra_include_paths=[str(src_dir)],
@@ -693,7 +792,9 @@ def _make_candidate_fast_key(
     mode: str,
     dtype_str: str,
     grad_w: Optional[bool] = None,
-    use_multiwarp_candidates: bool = True,
+    grad_x: Optional[bool] = None,
+    grad_y: Optional[bool] = None,
+    use_multiwarp_candidates: bool = False,
 ) -> Tuple[Any, ...]:
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
@@ -715,6 +816,8 @@ def _make_candidate_fast_key(
         str(mode),
         str(dtype_str),
         None if grad_w is None else bool(grad_w),
+        None if grad_x is None else bool(grad_x),
+        None if grad_y is None else bool(grad_y),
         bool(use_multiwarp_candidates),
         bool(use_x_src),
         bool(use_y_src),
@@ -836,6 +939,16 @@ def _discover_prebuilt_jit_candidates(
     This is the key fast path: it avoids calling codegen_fn(), so scheduler
     search/LARS scheduling and CUDA source regeneration are skipped entirely.
     """
+    if not ENABLE_JIT_CANDIDATES:
+        return []
+
+    meta_path = _best_candidate_meta_path(kind, tune_key)
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("tuning_policy") != _tuning_policy_signature():
+            return []
+    except (OSError, ValueError):
+        return []
 
     build_root = _default_build_root()
     if not build_root.exists():
@@ -908,6 +1021,8 @@ def _load_persistent_best_candidate(
     When this hits, callers can skip candidate generation/scheduling/compilation
     and also skip runtime benchmarking.
     """
+    if not ENABLE_JIT_CANDIDATES:
+        return None
 
     meta_path = _best_candidate_meta_path(kind, tune_key)
     if not meta_path.exists():
@@ -915,7 +1030,8 @@ def _load_persistent_best_candidate(
 
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("tune_key") != tune_key or meta.get("kind") != kind:
+        if (meta.get("tune_key") != tune_key or meta.get("kind") != kind
+                or meta.get("tuning_policy") != _tuning_policy_signature()):
             return None
 
         module_name = str(meta["module_name"])
@@ -949,6 +1065,7 @@ def _store_persistent_best_candidate(
     tag: str,
     mod: object,
     best_ms: float,
+    tuning_report: Optional[Dict[str, Any]] = None,
 ) -> None:
 
     module_name = getattr(mod, "__name__", None)
@@ -967,6 +1084,8 @@ def _store_persistent_best_candidate(
                     "module_name": module_name,
                     "best_ms": float(best_ms),
                     "time": time.time(),
+                    "tuning_policy": _tuning_policy_signature(),
+                    "tuning_report": tuning_report,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1171,7 +1290,7 @@ def _build_jit_candidates_from_sources(
     cache: Dict[str, object],
     kind: str,
     u_dim: int,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> List[Tuple[str, object]]:
     """Build scheduler candidates plus optional auto-warp variants.
 
@@ -1185,6 +1304,17 @@ def _build_jit_candidates_from_sources(
     This function is shared by Uniform1D and STC.  STC passes one raw CUDA
     source, while Uniform1D may pass multiple scheduler/codegen candidates.
     """
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
+    if not use_multiwarp_candidates:
+        if len(raw_candidates) != 1:
+            raise RuntimeError("Candidate search is disabled: expected one base source")
+        _tag, code = raw_candidates[0]
+        module_name = f"{tune_key}_base_{_sha1_text(code)}"
+        mod = _build_jit_module_common(
+            module_name=module_name, cache=cache, kind=f"{kind}:base",
+            codegen_fn=lambda: code,
+        )
+        return [("base", mod)]
     use_multiwarp_candidates = bool(use_multiwarp_candidates)
     base_infos = _candidate_infos_from_sources(
         tune_key=tune_key,
@@ -1337,7 +1467,7 @@ def _make_fwd_module_name(
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     # Include all code-affecting fields in the hash.  The previous version did
     # not include layout flags or coeff_list, which can accidentally reuse a
@@ -1353,7 +1483,7 @@ def _make_fwd_module_name(
     h = _sha1_text(sig)
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
-    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    warp_tag = "autowarp_global_v1" if use_multiwarp_candidates else "base_global_v1"
     return f"uniform1d_fwd_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 def _make_bwd_module_name(
@@ -1368,20 +1498,22 @@ def _make_bwd_module_name(
     coeff_list,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     layout_tag: str = "dense",
     iw_dim: Optional[int] = None,
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     # Scheduler backward replaces the previous fused/split backward codegen.
     # Include layout and optional static dimensions in the signature so disk
     # cache cannot accidentally reuse a stale backward module generated by the
     # old split/combine paths or by a different scatter/source layout.
     sig = repr((
-        "scheduler_bwd",
-        P, u_dim, dtype_str, mode, grad_w, layout_tag,
+        "scheduler_bwd_path_split_space_v3",
+        P, u_dim, dtype_str, mode, grad_w, grad_x, grad_y, layout_tag,
         bool(use_multiwarp_candidates),
         iw_dim, ix_dim, ky_dim, v_dim,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
@@ -1391,8 +1523,10 @@ def _make_bwd_module_name(
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
     gw_tag = "gradw" if grad_w else "nogradw"
-    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
-    return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{warp_tag}_jit_{dtype_str}_{h}"
+    gx_tag = "gradx" if grad_x else "nogradx"
+    gy_tag = "grady" if grad_y else "nogrady"
+    warp_tag = "autowarp_global_v3_pathsplit" if use_multiwarp_candidates else "base_global_v3_pathsplit"
+    return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 
 def _make_double_bwd_module_name(
@@ -1407,16 +1541,18 @@ def _make_double_bwd_module_name(
     coeff_list,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     layout_tag: str = "dense",
     iw_dim: Optional[int] = None,
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     sig = repr((
         "scheduler_double_bwd_v1",
-        P, u_dim, dtype_str, mode, grad_w, layout_tag,
+        P, u_dim, dtype_str, mode, grad_w, grad_x, grad_y, layout_tag,
         bool(use_multiwarp_candidates),
         iw_dim, ix_dim, ky_dim, v_dim,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
@@ -1426,10 +1562,12 @@ def _make_double_bwd_module_name(
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
     gw_tag = "gradw" if grad_w else "nogradw"
-    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    gx_tag = "gradx" if grad_x else "nogradx"
+    gy_tag = "grady" if grad_y else "nogrady"
+    warp_tag = "autowarp_global_v1" if use_multiwarp_candidates else "base_global_v1"
     return (
         f"uniform1d_double_bwd_sched_{mode_str}_u{u_dim}_path{P}_"
-        f"{layout_tag}_{gw_tag}_{warp_tag}_jit_{dtype_str}_{h}"
+        f"{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
     )
 
 
@@ -1652,7 +1790,7 @@ def _build_fwd_jit_candidates(
             out_path="generated_uniform1d_fwd_baseline_unrolled.cu",
             path_semantics="wxy",
         ) """
-    print(f"[JIT][FWD] generate candidates for: {tune_key}")
+    print(f"[JIT][FWD] generate {'candidates' if ENABLE_JIT_CANDIDATES else 'base implementation'} for: {tune_key}")
     codegen_out = _codegen_candidates()
     raw_candidates = _normalize_codegen_candidates(codegen_out)
     if not raw_candidates:
@@ -1728,6 +1866,8 @@ def _build_bwd_jit_candidates(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     use_multiwarp_candidates: Optional[bool] = None,
 ) -> Tuple[str, List[Tuple[str, object]]]:
     """
@@ -1763,6 +1903,8 @@ def _build_bwd_jit_candidates(
         mode=mode,
         dtype_str=dtype_str,
         grad_w=grad_w,
+        grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
     fast_key = (fast_key, warp_reduce)
@@ -1816,6 +1958,8 @@ def _build_bwd_jit_candidates(
             coeff_list=coeff_cpu,
             dtype_str=dtype_str,
             grad_w=grad_w,
+            grad_x=grad_x,
+            grad_y=grad_y,
             layout_tag=layout_tag,
             iw_dim=iw_dim,
             ix_dim=ix_dim,
@@ -1867,6 +2011,10 @@ def _build_bwd_jit_candidates(
             v_dim=v_dim,
             mode=mode,
             need_grad_w=grad_w,
+            need_grad_x=grad_x,
+            need_grad_y=grad_y,
+            generate_candidates=bool(use_multiwarp_candidates),
+            out_path="",
         )
 
         """ return generate_code_uniform1d_bwd_baseline_unrolled(
@@ -1885,7 +2033,7 @@ def _build_bwd_jit_candidates(
             path_semantics="wxy",
         ) """
 
-    print(f"[JIT][BWD] generate candidates for: {tune_key}")
+    print(f"[JIT][BWD] generate {'candidates' if ENABLE_JIT_CANDIDATES else 'base implementation'} for: {tune_key}")
     raw_candidates = _normalize_codegen_candidates(_codegen_candidates())
     if not raw_candidates:
         raise RuntimeError("backward codegen returned zero candidates")
@@ -1919,6 +2067,8 @@ def _build_bwd_jit_module(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     use_multiwarp_candidates: Optional[bool] = None,
 ):
     # Backward-compatible wrapper: build candidates and return the first one.
@@ -1940,6 +2090,8 @@ def _build_bwd_jit_module(
         mode=mode,
         dtype_str=dtype_str,
         grad_w=grad_w,
+        grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
     return modules[0][1]
@@ -1962,7 +2114,10 @@ def _build_double_bwd_jit_candidates(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     use_multiwarp_candidates: Optional[bool] = None,
+    split_outputs: Optional[bool] = None,
 ) -> Tuple[str, List[Tuple[str, object]]]:
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
@@ -1970,14 +2125,19 @@ def _build_double_bwd_jit_candidates(
         use_multiwarp_candidates
     )
 
-    split_outputs = _env_bool("FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT", False)
+    if split_outputs is None:
+        # Direct builder calls have no batch/device information for auto mode.
+        setting = os.environ.get("FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT", "auto")
+        split_outputs = (setting.strip().lower() != "auto"
+                         and _env_bool("FASTEQ_EXPERIMENTAL_U1D_DOUBLE_SPLIT", False))
     fast_key = _make_candidate_fast_key(
         kind="DOUBLE_BWD",
         i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
         coeff_list=coeff_list,
         input_indices=input_indices, output_indices=output_indices,
         u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
-        mode=mode, dtype_str=dtype_str, grad_w=grad_w,
+        mode=mode, dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
     fast_key = (fast_key, split_outputs)
@@ -1995,7 +2155,8 @@ def _build_double_bwd_jit_candidates(
         tune_key = _make_double_bwd_module_name(
             P=len(i_cpu), u_dim=u_dim, mode=mode,
             i_list=i_cpu, j_list=j_cpu, k_list=k_cpu, v_list=v_cpu,
-            coeff_list=coeff_cpu, dtype_str=dtype_str, grad_w=grad_w,
+            coeff_list=coeff_cpu, dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x,
+            grad_y=grad_y,
             layout_tag=layout_tag, iw_dim=iw_dim, ix_dim=ix_dim,
             ky_dim=ky_dim, v_dim=v_dim,
             use_multiwarp_candidates=use_multiwarp_candidates,
@@ -2026,13 +2187,13 @@ def _build_double_bwd_jit_candidates(
     if prebuilt:
         return tune_key, prebuilt
 
-    print(f"[JIT][DOUBLE_BWD] generate candidates for: {tune_key}")
+    print(f"[JIT][DOUBLE_BWD] generate {'candidates' if ENABLE_JIT_CANDIDATES else 'base implementation'} for: {tune_key}")
     codegen_out = generate_code_uniform1d_double_bwd_with_scheduler(
         i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
         coeff_list=coeff_list,
         input_indices=input_indices, output_indices=output_indices,
         u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
-        mode=mode, need_grad_w=grad_w,
+        mode=mode, need_grad_w=grad_w, need_grad_x=grad_x, need_grad_y=grad_y,
         out_path="", profile=False, profile_print=False, split_outputs=split_outputs,
     )
     raw_candidates = _normalize_codegen_candidates(codegen_out)
@@ -2052,38 +2213,31 @@ def _build_double_bwd_jit_candidates(
 # -----------------------------------------------------------------------------
 # runtime dispatch
 # -----------------------------------------------------------------------------
-def _call_fwd_module(
-    mod,
-    *,
-    w,
-    x,
-    y,
-    src_idx,
-    dst_idx,
-    out_seg_num,
-    fused_scatter: bool,
-):
+def _call_fwd_module(mod, *, w, x, y, src_idx, dst_idx,
+                     out_seg_num, fused_scatter: bool):
+    # Generated launchers omit the source argument in dense mode.
+    args = [w, x, y]
+    if src_idx is not None:
+        args.append(src_idx)
     if fused_scatter:
-        return mod.run(w, x, y, src_idx, dst_idx, out_seg_num)
-    return mod.run(w, x, y, src_idx, out_seg_num)
+        args.append(dst_idx)
+    args.append(int(out_seg_num))
+    return mod.run(*args)
 
 
 
-def _call_bwd_module(
-    mod,
-    *,
-    w,
-    x,
-    y,
-    grad_out,
-    src_idx,
-    dst_idx,
-    out_seg_num,
-    fused_scatter: bool,
-):
+
+def _call_bwd_module(mod, *, w, x, y, grad_out, src_idx, dst_idx,
+                     out_seg_num, fused_scatter: bool):
+    # Generated launchers omit the source argument in dense mode.
+    args = [w, x, y, grad_out]
+    if src_idx is not None:
+        args.append(src_idx)
     if fused_scatter:
-        return mod.run(w, x, y, grad_out, src_idx, dst_idx, out_seg_num)
-    return mod.run(w, x, y, grad_out, src_idx, out_seg_num)
+        args.append(dst_idx)
+    args.append(int(out_seg_num))
+    return mod.run(*args)
+
 
 
 
@@ -2105,11 +2259,16 @@ def _call_double_bwd_module(
     use_src: bool,
     fused_scatter: bool,
     need_grad_w: bool,
+    need_grad_x: bool,
+    need_grad_y: bool,
 ):
     args = [w, x, y, grad_out]
     if need_grad_w:
         args.append(grad_grad_w)
-    args.extend([grad_grad_x, grad_grad_y])
+    if need_grad_x:
+        args.append(grad_grad_x)
+    if need_grad_y:
+        args.append(grad_grad_y)
     if use_src:
         args.append(src_idx)
     if fused_scatter:
@@ -2119,95 +2278,88 @@ def _call_double_bwd_module(
 
 
 def _benchmark_and_select_best_jit_candidate(
-    *,
-    tune_key: str,
-    candidates: List[Tuple[str, object]],
-    best_cache: Dict[str, Tuple[str, object, float]],
-    kind: str,
-    tune_enabled: bool,
-    warmup: int,
-    repeat: int,
-    call_fn,
+    *, tune_key: str, candidates: List[Tuple[str, object]],
+    best_cache: Dict[str, Tuple[str, object, float]], kind: str,
+    tune_enabled: bool, warmup: int, repeat: int, call_fn,
+    batch_size: Optional[int] = None, case_factory=None, case_call_fn=None,
 ) -> Tuple[str, object, float]:
-    """Benchmark compiled candidates and persist/prune the selected one.
-
-    ``call_fn`` receives a module and launches its ``run`` entry with the
-    operator-specific ABI.  Everything else is operator-agnostic and is reused
-    by Uniform1D FWD/BWD and STC FWD/BWD.
-    """
+    """Select on the largest feasible batch; prune only after all sizes finish."""
+    if not ENABLE_JIT_CANDIDATES:
+        if len(candidates) != 1:
+            raise RuntimeError("Candidate search is disabled: expected one base module")
+        tag, mod = candidates[0]
+        best = (tag, mod, float("nan"))
+        best_cache[tune_key] = best
+        return best
     if tune_key in best_cache:
         return best_cache[tune_key]
     if not candidates:
         raise RuntimeError(f"no {kind.lower()} candidates to benchmark")
-
-    if len(candidates) == 1 or not tune_enabled:
+    if not tune_enabled or len(candidates) == 1:
         tag, mod = candidates[0]
         best = (tag, mod, float("nan"))
         best_cache[tune_key] = best
-        _store_persistent_best_candidate(
-            tune_key=tune_key,
-            kind=kind,
-            tag=tag,
-            mod=mod,
-            best_ms=float("nan"),
-        )
-        _keep_only_best_jit_candidate(
-            tune_key=tune_key,
-            kind=kind,
-            tag=tag,
-            mod=mod,
-        )
-        if len(candidates) == 1:
-            print(f"[JIT][{kind}][tune] only one candidate: {tag}")
-        else:
-            print(f"[JIT][{kind}][tune] disabled, use first candidate: {tag}")
         return best
-
-    print(
-        f"[JIT][{kind}][tune] benchmarking {len(candidates)} candidates "
-        f"for {tune_key}, warmup={warmup}, repeat={repeat}"
-    )
-
-    timings: List[Tuple[float, str, object]] = []
-    for tag, mod in candidates:
-        try:
-            for _ in range(warmup):
-                call_fn(mod)
-            torch.cuda.synchronize()
-
-            t0 = time.perf_counter()
-            for _ in range(repeat):
-                call_fn(mod)
-            torch.cuda.synchronize()
-            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
-            timings.append((avg_ms, tag, mod))
-            regs = getattr(mod, "__fasteq_registers_per_thread__", None)
-            print(f"[JIT][{kind}][tune] candidate={tag:>16s} regs={regs} avg={avg_ms:.4f} ms")
-        except BaseException as exc:
-            print(f"[JIT][{kind}][tune] candidate={tag} failed at runtime: {exc}")
-
-    if not timings:
-        raise RuntimeError(f"all {kind.lower()} candidates failed during runtime benchmark")
-
-    timings.sort(key=lambda x: x[0])
-    best_ms, best_tag, best_mod = timings[0]
-    best = (best_tag, best_mod, best_ms)
+    import statistics
+    samples = _env_int("FASTEQ_JIT_TUNE_SAMPLES", 3, min_value=1)
+    repeat = max(1, int(repeat))
+    actual_size = int(batch_size or 1)
+    sizes = _tuning_sizes(actual_size) if case_factory is not None else [actual_size]
+    prepare = case_factory if case_factory is not None else (lambda size: None)
+    def measure(mod, case):
+        invoke = (lambda: case_call_fn(mod, case)) if case_call_fn is not None else (lambda: call_fn(mod))
+        device = next((v.device for v in case.values() if v is not None), None) if isinstance(case, dict) else None
+        def run_once():
+            output = invoke()
+            del output
+        for _ in range(max(0, int(warmup))): run_once()
+        torch.cuda.synchronize(device)
+        latencies = []
+        for _ in range(samples):
+            begin = time.perf_counter()
+            for _ in range(repeat): run_once()
+            torch.cuda.synchronize(device)
+            latencies.append((time.perf_counter() - begin) * 1000.0 / repeat)
+        return statistics.median(latencies)
+    print(f"[JIT][{kind}][tune] candidates={len(candidates)} sizes={sizes} selection=largest-feasible")
+    best, report = _benchmark_sizes(candidates, sizes=sizes, actual_size=actual_size,
+        prepare_case=prepare, measure_case=measure, cleanup=torch.cuda.empty_cache)
     best_cache[tune_key] = best
-    _store_persistent_best_candidate(
-        tune_key=tune_key,
-        kind=kind,
-        tag=best_tag,
-        mod=best_mod,
-        best_ms=best_ms,
-    )
-    _keep_only_best_jit_candidate(
-        tune_key=tune_key,
-        kind=kind,
-        tag=best_tag,
-        mod=best_mod,
-    )
-    print(f"[JIT][{kind}][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
+    tag, mod, ms = best
+    _store_persistent_best_candidate(tune_key=tune_key, kind=kind, tag=tag, mod=mod,
+        best_ms=ms, tuning_report=report)
+    _keep_only_best_jit_candidate(tune_key=tune_key, kind=kind, tag=tag, mod=mod)
+    print(f"[JIT][{kind}][tune] selected={tag} size={report['selected_size']} median={ms:.6f} ms")
     return best
+
+
+def _uniform1d_tuning_factory(*, w, x, y, src_idx, dst_idx,
+                             use_x_src, use_y_src, grad_out=None,
+                             grad_grad_w=None, grad_grad_x=None, grad_grad_y=None):
+    batch = int(src_idx.numel()) if src_idx is not None else (
+        int(dst_idx.numel()) if dst_idx is not None else int(x.size(0)))
+    data = dict(w=w, x=x, y=y, src_idx=src_idx, dst_idx=dst_idx)
+    if grad_out is not None: data['grad_out'] = grad_out
+    for name, value in (('grad_grad_w', grad_grad_w), ('grad_grad_x', grad_grad_x), ('grad_grad_y', grad_grad_y)):
+        if value is not None: data[name] = value
+    groups = []
+    if src_idx is not None:
+        targets = []
+        if use_x_src: targets += ['x', 'grad_grad_x']
+        if use_y_src: targets += ['y', 'grad_grad_y']
+        groups.append(('src_idx', targets))
+    if dst_idx is not None and grad_out is not None:
+        groups.append(('dst_idx', ['grad_out']))
+    # Forward scatter also needs independent destination IDs, but has no
+    # destination tensor yet. Keep x at the complete replicated node-domain size,
+    # matching the existing forward launcher's output shape [x.size(0), V, U].
+    if dst_idx is not None and grad_out is None:
+        groups.append(('dst_idx', ['x']))
+    factory = _make_case_factory(data, batch_size=batch,
+        per_row=('w','x','y','grad_out','grad_grad_w','grad_grad_x','grad_grad_y'),
+        index_groups=groups, broadcast_rows=('w','grad_grad_w'))
+    return batch, factory
+
 
 def _select_best_fwd_module(
     *,
@@ -2220,8 +2372,16 @@ def _select_best_fwd_module(
     dst_idx,
     out_seg_num,
     fused_scatter: bool,
+    use_x_src: bool = False,
+    use_y_src: bool = False,
 ) -> Tuple[str, object, float]:
+    if tune_key in _FWD_BEST_CANDIDATE_CACHE:
+        return _FWD_BEST_CANDIDATE_CACHE[tune_key]
+
     tune_enabled, warmup, repeat = _get_fwd_tune_params()
+    batch_size, case_factory = _uniform1d_tuning_factory(
+        w=w, x=x, y=y, src_idx=src_idx, dst_idx=dst_idx,
+        use_x_src=use_x_src, use_y_src=use_y_src)
     return _benchmark_and_select_best_jit_candidate(
         tune_key=tune_key,
         candidates=candidates,
@@ -2230,6 +2390,11 @@ def _select_best_fwd_module(
         tune_enabled=tune_enabled,
         warmup=warmup,
         repeat=repeat,
+        batch_size=batch_size, case_factory=case_factory,
+        case_call_fn=lambda mod, case: _call_fwd_module(
+            mod, w=case['w'], x=case['x'], y=case['y'],
+            src_idx=case['src_idx'], dst_idx=case['dst_idx'],
+            out_seg_num=out_seg_num, fused_scatter=fused_scatter),
         call_fn=lambda mod: _call_fwd_module(
             mod,
             w=w,
@@ -2254,8 +2419,16 @@ def _select_best_bwd_module(
     dst_idx,
     out_seg_num,
     fused_scatter: bool,
+    use_x_src: bool = False,
+    use_y_src: bool = False,
 ) -> Tuple[str, object, float]:
+    if tune_key in _BWD_BEST_CANDIDATE_CACHE:
+        return _BWD_BEST_CANDIDATE_CACHE[tune_key]
+
     tune_enabled, warmup, repeat = _get_bwd_tune_params()
+    batch_size, case_factory = _uniform1d_tuning_factory(
+        w=w, x=x, y=y, src_idx=src_idx, dst_idx=dst_idx,
+        use_x_src=use_x_src, use_y_src=use_y_src, grad_out=grad_out)
     return _benchmark_and_select_best_jit_candidate(
         tune_key=tune_key,
         candidates=candidates,
@@ -2264,6 +2437,11 @@ def _select_best_bwd_module(
         tune_enabled=tune_enabled,
         warmup=warmup,
         repeat=repeat,
+        batch_size=batch_size, case_factory=case_factory,
+        case_call_fn=lambda mod, case: _call_bwd_module(
+            mod, w=case['w'], x=case['x'], y=case['y'],
+            src_idx=case['src_idx'], dst_idx=case['dst_idx'],
+            out_seg_num=out_seg_num, fused_scatter=fused_scatter, grad_out=case['grad_out']),
         call_fn=lambda mod: _call_bwd_module(
             mod,
             w=w,
@@ -2288,8 +2466,15 @@ def _select_best_double_bwd_module(
     out_seg_num,
     use_src: bool,
     fused_scatter: bool,
+    use_x_src: bool = False,
+    use_y_src: bool = False,
     need_grad_w: bool,
+    need_grad_x: bool,
+    need_grad_y: bool,
 ) -> Tuple[str, object, float]:
+    if tune_key in _DOUBLE_BWD_BEST_CANDIDATE_CACHE:
+        return _DOUBLE_BWD_BEST_CANDIDATE_CACHE[tune_key]
+
     # Double backward uses its own env controls when present and otherwise
     # inherits the regular backward tuning policy.
     tune_enabled = _env_bool(
@@ -2306,6 +2491,9 @@ def _select_best_double_bwd_module(
         _DEFAULT_UNIFORM1D_TUNE_REPEAT,
         min_value=1,
     )
+    batch_size, case_factory = _uniform1d_tuning_factory(
+        w=w, x=x, y=y, src_idx=src_idx, dst_idx=dst_idx,
+        use_x_src=use_x_src, use_y_src=use_y_src, grad_out=grad_out, grad_grad_w=grad_grad_w, grad_grad_x=grad_grad_x, grad_grad_y=grad_grad_y)
     return _benchmark_and_select_best_jit_candidate(
         tune_key=tune_key,
         candidates=candidates,
@@ -2314,6 +2502,13 @@ def _select_best_double_bwd_module(
         tune_enabled=tune_enabled,
         warmup=warmup,
         repeat=repeat,
+        batch_size=batch_size, case_factory=case_factory,
+        case_call_fn=lambda mod, case: _call_double_bwd_module(
+            mod, w=case['w'], x=case['x'], y=case['y'],
+            src_idx=case['src_idx'], dst_idx=case['dst_idx'],
+            out_seg_num=out_seg_num, fused_scatter=fused_scatter, grad_out=case['grad_out'], grad_grad_w=case.get('grad_grad_w'),
+            grad_grad_x=case.get('grad_grad_x'), grad_grad_y=case.get('grad_grad_y'),
+            use_src=use_src, need_grad_w=need_grad_w, need_grad_x=need_grad_x, need_grad_y=need_grad_y),
         call_fn=lambda mod: _call_double_bwd_module(
             mod,
             w=w, x=x, y=y, grad_out=grad_out,
@@ -2325,8 +2520,165 @@ def _select_best_double_bwd_module(
             use_src=use_src,
             fused_scatter=fused_scatter,
             need_grad_w=need_grad_w,
+            need_grad_x=need_grad_x,
+            need_grad_y=need_grad_y,
         ),
     )
+
+def _python_metadata_values(value):
+    """Content identity for path metadata, without repeated GPU-to-CPU copies.
+
+    Weak references prevent pointer/object-ID reuse from matching old metadata.
+    Tensor version changes invalidate the memo. Unversioned inference tensors
+    are read again because their in-place mutations cannot be tracked safely.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    if not isinstance(value, torch.Tensor):
+        return tuple(_tensor_to_cpu_list(value))
+    identity=id(value)
+    try: version=int(value._version)
+    except (RuntimeError, AttributeError): version=None
+    cached=_PYTHON_METADATA_CONTENT_CACHE.get(identity)
+    if version is not None and cached is not None and cached[0]() is value and cached[1]==version:
+        return cached[2]
+    contents=tuple(_tensor_to_cpu_list(value))
+    if version is not None:
+        def discard(ref, identity=identity):
+            current=_PYTHON_METADATA_CONTENT_CACHE.get(identity)
+            if current is not None and current[0] is ref:
+                _PYTHON_METADATA_CONTENT_CACHE.pop(identity,None)
+        _PYTHON_METADATA_CONTENT_CACHE[identity]=(weakref.ref(value,discard),version,contents)
+    return contents
+
+
+def _python_operator_key(**kwargs):
+    """Use path contents, rather than metadata allocations, for Python modules."""
+    for name in ('i_list','j_list','k_list','v_list','coeff_list'):
+        kwargs[name]=_python_metadata_values(kwargs[name])
+    return _make_candidate_fast_key(**kwargs)
+
+
+def _python_runtime_key(phase, *tensors):
+    """Reuse the selected strategy across batches with the same operator layout."""
+    layouts=tuple((tuple(t.shape[1:]),str(t.dtype),str(t.device)) if t is not None else None for t in tensors)
+    shared_w=bool(tensors and tensors[0] is not None and tensors[0].shape[0]==1)
+    policy=tuple(sorted((k,v) for k,v in os.environ.items() if k.startswith(('FASTEQ_PYTHON_', 'FASTEQ_UNIFORM1D_', 'FASTEQ_JIT_TUNE_'))))
+    return phase,bool(ENABLE_JIT_CANDIDATES),shared_w,layouts,policy
+
+
+def _build_python_tuned_module(*, backend, phase, build_args, build_kwargs,
+                               options, tensors, src_idx, dst_idx,
+                               out_seg_num, fused_scatter, use_x_src, use_y_src):
+    """Use the native multi-size benchmark policy with Python-only persistence."""
+    import statistics
+    import importlib.metadata
+    from .auto_schedule.python_tuning import candidate_configs, select_best
+    w,x,y = (tensors[k] for k in ('w','x','y'))
+    if phase == 'fwd': tune_enabled,warmup,repeat = _get_fwd_tune_params()
+    elif phase == 'bwd': tune_enabled,warmup,repeat = _get_bwd_tune_params()
+    else:
+        tune_enabled = _env_bool('FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE', _DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED)
+        warmup = _env_int('FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE_WARMUP', _DEFAULT_UNIFORM1D_TUNE_WARMUP)
+        repeat = _env_int('FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE_REPEAT', _DEFAULT_UNIFORM1D_TUNE_REPEAT, min_value=1)
+    enabled = bool(ENABLE_JIT_CANDIDATES and tune_enabled)
+    configs = candidate_configs(backend,phase,options,enabled=enabled,
+        all_gradients=all(build_kwargs.get('need_grad_'+k,True) for k in ('w','x','y')))
+    builder = _python_codegen_builder(backend,phase)
+    try: compiler_version = importlib.metadata.version('triton')
+    except importlib.metadata.PackageNotFoundError: compiler_version = 'unknown'
+    props = torch.cuda.get_device_properties(w.device)
+    signature = dict(cache_policy='first-call-per-operator-v2',metadata=[list(_python_metadata_values(a)) for a in build_args],weight_broadcast=bool(w.size(0)==1),
+        build_kwargs={k:v for k,v in build_kwargs.items() if k not in ('input_indices','output_indices')},
+        input_indices=sorted((build_kwargs.get('input_indices') or {}).keys()),
+        output_indices=sorted((build_kwargs.get('output_indices') or {}).keys()),
+        tensors={k:dict(shape=list(t.shape[1:]),dtype=str(t.dtype),device=str(t.device)) for k,t in tensors.items() if t is not None},
+        indices={k:(dict(shape=list(t.shape[1:]),dtype=str(t.dtype),device=str(t.device)) if t is not None else None) for k,t in (('src',src_idx),('dst',dst_idx))},
+        gpu=dict(name=props.name,major=props.major,minor=props.minor,multi_processor_count=props.multi_processor_count),
+        torch_version=str(torch.__version__),triton_version=compiler_version,
+        tuning_policy=_tuning_policy_signature(),warmup=warmup,repeat=repeat,
+        samples=_env_int('FASTEQ_JIT_TUNE_SAMPLES',3,min_value=1))
+    factory_args = dict(w=w,x=x,y=y,src_idx=src_idx,dst_idx=dst_idx,use_x_src=use_x_src,use_y_src=use_y_src)
+    for k in ('grad_out','grad_grad_w','grad_grad_x','grad_grad_y'):
+        if tensors.get(k) is not None:factory_args[k]=tensors[k]
+    batch,factory = _uniform1d_tuning_factory(**factory_args)
+    def invoke(mod,case):
+        common = {k:case[k] for k in ('w','x','y','src_idx','dst_idx')}
+        common.update(out_seg_num=out_seg_num,fused_scatter=fused_scatter)
+        if phase == 'fwd':return _call_fwd_module(mod,**common)
+        if phase == 'bwd':return _call_bwd_module(mod,grad_out=case['grad_out'],**common)
+        return _call_double_bwd_module(mod,grad_out=case['grad_out'],
+            grad_grad_w=case.get('grad_grad_w'),grad_grad_x=case.get('grad_grad_x'),grad_grad_y=case.get('grad_grad_y'),
+            use_src=use_x_src or use_y_src,
+            need_grad_w=bool(build_kwargs['need_grad_w']),need_grad_x=bool(build_kwargs['need_grad_x']),need_grad_y=bool(build_kwargs['need_grad_y']),**common)
+    def measure(mod,case):
+        # All lazy Triton compilation and allocations in warmup precede timing.
+        # Measure the complete module: split's three kernels and zeroing are included.
+        for _ in range(max(1,int(warmup))):invoke(mod,case)
+        torch.cuda.synchronize(w.device)
+        times=[]
+        for _ in range(signature['samples']):
+            begin=time.perf_counter()
+            for _ in range(max(1,int(repeat))):
+                output=invoke(mod,case)
+                del output
+            torch.cuda.synchronize(w.device)
+            times.append((time.perf_counter()-begin)*1000.0/max(1,int(repeat)))
+        return statistics.median(times)
+    def benchmark(candidates):
+        # Compile and validate a small case first: a lazy JIT failure must not
+        # abort the entire search, regardless of the external size-policy code.
+        probe=factory(min(batch,64))
+        valid=[];reference=None;failures=[]
+        for tag,mod in candidates:
+            output=None
+            try:
+                output=invoke(mod,probe)
+                torch.cuda.synchronize(w.device)
+                if phase=='bwd':
+                    expected=sum(bool(build_kwargs['need_grad_'+k]) for k in ('w','x','y'))
+                    if not isinstance(output,(list,tuple)) or len(output)!=expected:
+                        raise RuntimeError('backward candidate returned an incompatible output ABI')
+                if reference is not None:
+                    # Recursively handles tensors/tuples and double-bwd outputs.
+                    tolerance=dict(rtol=1e-9,atol=1e-10) if w.dtype==torch.float64 else dict(rtol=3e-4,atol=3e-5)
+                    torch.testing.assert_close(output,reference,**tolerance)
+                valid.append((tag,mod))
+                if reference is None:reference=output
+                del output
+            except Exception as exc:
+                failures.append(f'{tag}: {exc}')
+                print(f'[JIT][{backend.upper()}][tune] skip {tag} during compile/check: {exc}')
+            finally:
+                output=None
+        reference=None;probe=None
+        torch.cuda.empty_cache()
+        if not valid:raise RuntimeError('All Python candidates failed compile/check: '+'; '.join(failures))
+        candidates=valid
+        sizes=_tuning_sizes(batch)
+        print(f'[JIT][{backend.upper()}][{phase.upper()}][tune] candidates={len(candidates)} sizes={sizes} selection=largest-feasible')
+        return _benchmark_sizes(candidates,sizes=sizes,actual_size=batch,prepare_case=factory,
+            measure_case=measure,cleanup=torch.cuda.empty_cache)
+    return select_best(backend=backend,phase=phase,signature=signature,configs=configs,
+        builder=lambda config:builder(*build_args,**build_kwargs,**config),
+        benchmark=benchmark,enabled=enabled)
+
+
+def _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices):
+    """Dense support: w is shared or per row; x and y are per row.
+
+    Keep existing indexed behavior unchanged. x/y singleton broadcasting is
+    not implemented by these generated kernels and must not silently run.
+    """
+    if input_indices:
+        return
+    batch = int(output_indices[0].numel()) if 0 in output_indices else int(x.size(0))
+    if int(x.size(0)) != batch or int(y.size(0)) != batch:
+        raise ValueError("Dense Uniform1D requires x and y batch dimensions to equal "
+                         "the computation batch; singleton x/y broadcasting is unsupported")
+    if int(w.size(0)) not in (1, batch):
+        raise ValueError("Dense Uniform1D requires w batch dimension to be 1 or batch")
+
 
 def _run_fwd(
     *,
@@ -2346,6 +2698,9 @@ def _run_fwd(
     use_multiwarp_candidates: Optional[bool] = None,
 ):
 
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices)
     use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
         use_multiwarp_candidates
     )
@@ -2354,6 +2709,42 @@ def _run_fwd(
     ix_dim = int(x.size(1))
     ky_dim = int(y.size(1))
     v_dim = int(out_seg_num)
+
+    codegen_backend = _fasteq_codegen_backend()
+    if codegen_backend in ("triton", "gluon"):
+        backend_options, backend_options_key = _python_codegen_options(codegen_backend, "fwd")
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        fused_scatter = 0 in output_indices
+        if use_x_src:
+            src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
+        elif use_y_src:
+            src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
+        else:
+            src_idx = None
+        dst_idx = (
+            _as_int32_meta_tensor(output_indices[0]).contiguous()
+            if fused_scatter else None
+        )
+        key = _python_operator_key(
+            kind=f"{codegen_backend.upper()}_FWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
+            output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
+            ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim, mode=mode,
+            dtype_str=dtype_str, use_multiwarp_candidates=False,
+        )
+        key = (codegen_backend, backend_options_key, _python_runtime_key('fwd', w, x, y, src_idx, dst_idx), key)
+        mod = _TRITON_FWD_MODULE_CACHE.get(key)
+        if mod is None:
+            mod = _build_python_tuned_module(backend=codegen_backend,phase='fwd',
+                build_args=(i_list, j_list, k_list, v_list, coeff_list),build_kwargs=dict(input_indices=input_indices,output_indices=output_indices,u_dim=u_dim,mode=mode),
+                options=backend_options,tensors=dict(w=w,x=x,y=y),src_idx=src_idx,dst_idx=dst_idx,
+                out_seg_num=out_seg_num,fused_scatter=fused_scatter,use_x_src=use_x_src,use_y_src=use_y_src)
+            _TRITON_FWD_MODULE_CACHE[key] = mod
+        return _call_fwd_module(
+            mod, w=w, x=x, y=y, src_idx=src_idx, dst_idx=dst_idx,
+            out_seg_num=out_seg_num, fused_scatter=fused_scatter,
+        )
 
     tune_key, candidates = _build_fwd_jit_candidates(
         i_list=i_list,
@@ -2382,7 +2773,7 @@ def _run_fwd(
     elif use_y_src:
         src_idx = input_indices[2].to(torch.int32)
     else:
-        raise RuntimeError("Input_indices 1 and 2 all empty")
+        src_idx = None
 
     if fused_scatter:
         dst_idx = output_indices[0].to(torch.int32)
@@ -2396,6 +2787,7 @@ def _run_fwd(
         src_idx=src_idx, dst_idx=dst_idx,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
+        use_x_src=use_x_src, use_y_src=use_y_src,
     )
 
     out = _call_fwd_module(
@@ -2407,7 +2799,20 @@ def _run_fwd(
     )
     return out
 
-        
+
+
+def _validate_backward_result(result, grad_w, grad_x, grad_y):
+    """Reject stale full-gradient modules before partial-gradient unpacking."""
+    expected = int(bool(grad_w)) + int(bool(grad_x)) + int(bool(grad_y))
+    if not isinstance(result, (tuple, list)) or len(result) != expected:
+        actual = len(result) if isinstance(result, (tuple, list)) else type(result).__name__
+        raise RuntimeError(
+            f"Backward result ABI mismatch: expected {expected} outputs for "
+            f"grad_w={bool(grad_w)}, grad_x={bool(grad_x)}, grad_y={bool(grad_y)}, "
+            f"got {actual}. Rebuild the stale or incompatible JIT candidate."
+        )
+    return result
+
 
 def _run_bwd(
     *,
@@ -2430,13 +2835,60 @@ def _run_bwd(
     v_dim: Optional[int] = None,
     mode,
     grad_w,
+    grad_x=True,
+    grad_y=True,
     use_multiwarp_candidates: Optional[bool] = None,
 ):
 
+    """ torch.cuda.synchronize()
+    start_time = time.perf_counter() * 1000.0 """
+
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices)
     use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
         use_multiwarp_candidates
     )
     dtype_str = _get_scalar_t_str(w)
+    codegen_backend = _fasteq_codegen_backend()
+    if codegen_backend in ("triton", "gluon"):
+        backend_options, backend_options_key = _python_codegen_options(codegen_backend, "bwd")
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        fused_scatter = 0 in output_indices
+        if use_x_src:
+            src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
+        elif use_y_src:
+            src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
+        else:
+            src_idx = None
+        dst_idx = (
+            _as_int32_meta_tensor(output_indices[0]).contiguous()
+            if fused_scatter else None
+        )
+        grad_out_3d = grad_out.view(-1, out_seg_num, u_dim).contiguous()
+        key = _python_operator_key(
+            kind=f"{codegen_backend.upper()}_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
+            output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
+            ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim, mode=mode,
+            dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x, grad_y=grad_y,
+            use_multiwarp_candidates=False,
+        )
+        key = (codegen_backend, backend_options_key, _python_runtime_key('bwd', w, x, y, grad_out_3d, src_idx, dst_idx), key)
+        mod = _TRITON_BWD_MODULE_CACHE.get(key)
+        if mod is None:
+            mod = _build_python_tuned_module(backend=codegen_backend,phase='bwd',
+                build_args=(i_list, j_list, k_list, v_list, coeff_list),build_kwargs=dict(input_indices=input_indices,output_indices=output_indices,u_dim=u_dim,iw_dim=iw_dim,ix_dim=ix_dim,ky_dim=ky_dim,v_dim=v_dim,mode=mode,need_grad_w=bool(grad_w),need_grad_x=bool(grad_x),need_grad_y=bool(grad_y)),
+                options=backend_options,tensors=dict(w=w,x=x,y=y,grad_out=grad_out_3d),src_idx=src_idx,dst_idx=dst_idx,
+                out_seg_num=out_seg_num,fused_scatter=fused_scatter,use_x_src=use_x_src,use_y_src=use_y_src)
+            _TRITON_BWD_MODULE_CACHE[key] = mod
+        return _call_bwd_module(
+            mod, w=w, x=x, y=y, grad_out=grad_out_3d,
+            src_idx=src_idx, dst_idx=dst_idx, out_seg_num=out_seg_num,
+            fused_scatter=fused_scatter,
+        )
+
     tune_key, candidates = _build_bwd_jit_candidates(
         i_list=i_list,
         j_list=j_list,
@@ -2453,6 +2905,8 @@ def _run_bwd(
         dtype_str=dtype_str,
         mode=mode,
         grad_w=grad_w,
+        grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
 
@@ -2466,7 +2920,6 @@ def _run_bwd(
         src_idx = input_indices[2].to(torch.int32)
     else:
         src_idx = None
-        raise RuntimeError("Input_indices 1 and 2 all empty")
 
     grad_out = grad_out.view(-1, out_seg_num, u_dim)
 
@@ -2482,6 +2935,7 @@ def _run_bwd(
         src_idx=src_idx, dst_idx=dst_idx,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
+        use_x_src=use_x_src, use_y_src=use_y_src,
     )
 
     out =  _call_bwd_module(
@@ -2491,8 +2945,19 @@ def _run_bwd(
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
-    
-    return out
+    #print(f"best_tag:{best_tag}, tune_key:{tune_key}")
+    #print(f"x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
+    #print(f"src_idx:{src_idx}, dst_idx:{dst_idx}, out_seg_num:{out_seg_num}, fused_scatter:{fused_scatter}")
+
+
+    """ torch.cuda.synchronize()
+    end_time = time.perf_counter() * 1000.0
+    print(f"<< fasteq uniform1d _call_bwd_module cost: {end_time - start_time:.3f} ms >>") """
+
+    #print(f"uniform1d bwd x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
+
+
+    return _validate_backward_result(out, grad_w, grad_x, grad_y)
 
 
 def _run_double_bwd(
@@ -2519,19 +2984,85 @@ def _run_double_bwd(
     v_dim,
     mode,
     grad_w,
+    grad_x=None,
+    grad_y=None,
     use_multiwarp_candidates: Optional[bool] = None,
 ):
+    # Legacy callers requested all four second adjoints, even when the first
+    # weight gradient was omitted. Explicit masks use main's selective ABI.
+    legacy_outputs = grad_x is None and grad_y is None
+    grad_x = True if grad_x is None else bool(grad_x)
+    grad_y = True if grad_y is None else bool(grad_y)
+    if legacy_outputs and not grad_w:
+        grad_grad_w = torch.zeros_like(w)
+        grad_w = True
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices)
     use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
         use_multiwarp_candidates
     )
     dtype_str = _get_scalar_t_str(w)
+    codegen_backend = _fasteq_codegen_backend()
+    if codegen_backend in ("triton", "gluon"):
+        backend_options, backend_options_key = _python_codegen_options(codegen_backend, "double_bwd")
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        use_src = use_x_src or use_y_src
+        fused_scatter = 0 in output_indices
+        if use_x_src:
+            src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
+        elif use_y_src:
+            src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
+        else:
+            src_idx = None
+        dst_idx = (
+            _as_int32_meta_tensor(output_indices[0]).contiguous()
+            if fused_scatter else None
+        )
+        grad_out_3d = grad_out.view(-1, out_seg_num, u_dim).contiguous()
+        if bool(grad_w):
+            grad_grad_w = torch.zeros_like(w) if grad_grad_w is None else grad_grad_w.contiguous()
+        if bool(grad_x):
+            grad_grad_x = torch.zeros_like(x) if grad_grad_x is None else grad_grad_x.contiguous()
+        if bool(grad_y):
+            grad_grad_y = torch.zeros_like(y) if grad_grad_y is None else grad_grad_y.contiguous()
+        key = _python_operator_key(
+            kind=f"{codegen_backend.upper()}_DOUBLE_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
+            output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim,
+            ky_dim=ky_dim, v_dim=v_dim, mode=mode, dtype_str=dtype_str,
+            grad_w=grad_w, grad_x=grad_x, grad_y=grad_y, use_multiwarp_candidates=False,
+        )
+        key = (codegen_backend, backend_options_key, _python_runtime_key('double_bwd', w, x, y, grad_out_3d, grad_grad_w, grad_grad_x, grad_grad_y, src_idx, dst_idx), key)
+        mod = _TRITON_DOUBLE_BWD_MODULE_CACHE.get(key)
+        if mod is None:
+            mod = _build_python_tuned_module(backend=codegen_backend,phase='double_bwd',
+                build_args=(i_list, j_list, k_list, v_list, coeff_list),build_kwargs=dict(input_indices=input_indices,output_indices=output_indices,u_dim=u_dim,iw_dim=iw_dim,ix_dim=ix_dim,ky_dim=ky_dim,v_dim=v_dim,mode=mode,need_grad_w=bool(grad_w),need_grad_x=bool(grad_x),need_grad_y=bool(grad_y)),
+                options=backend_options,tensors=dict(w=w,x=x,y=y,grad_out=grad_out_3d,grad_grad_w=grad_grad_w,grad_grad_x=grad_grad_x,grad_grad_y=grad_grad_y),src_idx=src_idx,dst_idx=dst_idx,
+                out_seg_num=out_seg_num,fused_scatter=fused_scatter,use_x_src=use_x_src,use_y_src=use_y_src)
+            _TRITON_DOUBLE_BWD_MODULE_CACHE[key] = mod
+        return _call_double_bwd_module(
+            mod, w=w, x=x, y=y, grad_out=grad_out_3d,
+            grad_grad_w=grad_grad_w, grad_grad_x=grad_grad_x,
+            grad_grad_y=grad_grad_y, src_idx=src_idx, dst_idx=dst_idx,
+            out_seg_num=out_seg_num, use_src=use_src, fused_scatter=fused_scatter,
+            need_grad_w=bool(grad_w), need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
+        )
+
     tune_key, candidates = _build_double_bwd_jit_candidates(
         i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
         coeff_list=coeff_list,
         input_indices=input_indices, output_indices=output_indices,
         u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
         mode=mode, dtype_str=dtype_str, grad_w=bool(grad_w),
+        grad_x=bool(grad_x), grad_y=bool(grad_y),
         use_multiwarp_candidates=use_multiwarp_candidates,
+        split_outputs=_resolve_double_split_enabled(
+            w=w, x=x, grad_out=grad_out, mode=mode, u_dim=u_dim,
+            dims=(iw_dim, ix_dim, ky_dim, v_dim), paths=i_list.numel(),
+            grad_flags=(bool(grad_w), bool(grad_x), bool(grad_y)),
+            index_flags=(1 in input_indices, 2 in input_indices, 0 in output_indices)),
     )
 
     use_x_src = 1 in input_indices
@@ -2558,14 +3089,16 @@ def _run_double_bwd(
             grad_grad_w = torch.zeros_like(w)
         else:
             grad_grad_w = grad_grad_w.contiguous()
-    if grad_grad_x is None:
-        grad_grad_x = torch.zeros_like(x)
-    else:
-        grad_grad_x = grad_grad_x.contiguous()
-    if grad_grad_y is None:
-        grad_grad_y = torch.zeros_like(y)
-    else:
-        grad_grad_y = grad_grad_y.contiguous()
+    if bool(grad_x):
+        if grad_grad_x is None:
+            grad_grad_x = torch.zeros_like(x)
+        else:
+            grad_grad_x = grad_grad_x.contiguous()
+    if bool(grad_y):
+        if grad_grad_y is None:
+            grad_grad_y = torch.zeros_like(y)
+        else:
+            grad_grad_y = grad_grad_y.contiguous()
 
     _tag, mod, _ms = _select_best_double_bwd_module(
         tune_key=tune_key, candidates=candidates,
@@ -2576,8 +3109,11 @@ def _run_double_bwd(
         src_idx=src_idx, dst_idx=dst_idx,
         out_seg_num=out_seg_num,
         use_src=use_src,
+        use_x_src=1 in input_indices, use_y_src=2 in input_indices,
         fused_scatter=fused_scatter,
         need_grad_w=bool(grad_w),
+        need_grad_x=bool(grad_x),
+        need_grad_y=bool(grad_y),
     )
     return _call_double_bwd_module(
         mod,
@@ -2590,150 +3126,9 @@ def _run_double_bwd(
         use_src=use_src,
         fused_scatter=fused_scatter,
         need_grad_w=bool(grad_w),
+        need_grad_x=bool(grad_x),
+        need_grad_y=bool(grad_y),
     )
-
-@torch.no_grad()
-def _print_index_reuse_stats(
-    i_list: torch.Tensor,
-    j_list: torch.Tensor,
-    k_list: torch.Tensor,
-    v_list: torch.Tensor,
-    print_details: bool = True,
-) -> None:
-    """
-    统计路径索引的重复情况。
-
-    指标定义：
-      total:
-          索引总出现次数，即路径数量 P。
-
-      unique:
-          不同索引值的数量。
-
-      repeated_values:
-          出现次数大于 1 的不同索引值数量。
-
-      repeated_occurrences:
-          所有重复索引值对应的总出现次数。
-          例如 [0, 0, 0, 1, 2, 2] 中为 3 + 2 = 5。
-
-      reusable:
-          除第一次出现之外的重复出现次数，即理论可复用次数：
-              sum(count - 1) = total - unique
-
-      reuse_ratio:
-          reusable / total。
-
-      adjacent_reuse:
-          当前调度顺序下，相邻路径使用相同索引的次数。
-          该指标比全局 reusable 更能反映直接连续复用。
-    """
-
-    index_lists = {
-        "i": i_list,
-        "j": j_list,
-        "k": k_list,
-        "v": v_list,
-    }
-
-    print("\n[index reuse statistics]")
-    print(
-        f"{'index':<8}"
-        f"{'total':>10}"
-        f"{'unique':>10}"
-        f"{'repeat val':>12}"
-        f"{'repeat occ':>12}"
-        f"{'reusable':>12}"
-        f"{'reuse ratio':>14}"
-        f"{'adjacent':>12}"
-    )
-
-    for name, tensor in index_lists.items():
-        # 调试统计放到 CPU 上执行，避免后续 Python 格式化处理 GPU Tensor。
-        values_cpu = tensor.detach().reshape(-1).to(
-            device="cpu",
-            dtype=torch.int64,
-        )
-
-        total = values_cpu.numel()
-
-        if total == 0:
-            print(
-                f"{name:<8}"
-                f"{0:>10}"
-                f"{0:>10}"
-                f"{0:>12}"
-                f"{0:>12}"
-                f"{0:>12}"
-                f"{0.0:>13.2%}"
-                f"{0:>12}"
-            )
-            continue
-
-        unique_values, counts = torch.unique(
-            values_cpu,
-            sorted=True,
-            return_counts=True,
-        )
-
-        repeated_mask = counts > 1
-
-        unique_count = unique_values.numel()
-        repeated_value_count = int(repeated_mask.sum().item())
-
-        repeated_occurrences = int(
-            counts[repeated_mask].sum().item()
-        )
-
-        # 每个索引第一次出现不算复用，后续出现均算潜在复用。
-        reusable_counts = torch.clamp(counts - 1, min=0)
-        reusable_count = int(reusable_counts.sum().item())
-
-        reuse_ratio = reusable_count / total
-
-        # 当前路径顺序中，相邻两条路径使用同一索引的次数。
-        adjacent_reuse_count = int(
-            (values_cpu[1:] == values_cpu[:-1]).sum().item()
-        )
-
-        print(
-            f"{name:<8}"
-            f"{total:>10}"
-            f"{unique_count:>10}"
-            f"{repeated_value_count:>12}"
-            f"{repeated_occurrences:>12}"
-            f"{reusable_count:>12}"
-            f"{reuse_ratio:>13.2%}"
-            f"{adjacent_reuse_count:>12}"
-        )
-
-        if print_details and repeated_value_count > 0:
-            repeated_values = unique_values[repeated_mask]
-            repeated_counts = counts[repeated_mask]
-
-            details = [
-                (
-                    int(value.item()),
-                    int(count.item()),
-                    int(count.item()) - 1,
-                )
-                for value, count in zip(
-                    repeated_values,
-                    repeated_counts,
-                )
-            ]
-
-            # 优先展示出现次数最多的索引。
-            details.sort(key=lambda item: (-item[1], item[0]))
-
-            detail_text = ", ".join(
-                f"{name}[{value}]: count={count}, reuse={reuse}"
-                for value, count, reuse in details
-            )
-            print(f"  repeated {name}: {detail_text}")
-
-    print()
-
 
 # -----------------------------------------------------------------------------
 # Differentiable first backward / generated CUDA double backward
@@ -2746,7 +3141,10 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
     def forward(ctx, grad_out, w, x, y, i_list, j_list, k_list, v_list,
                 coeff_list, input_indices, output_indices, out_seg_num, u_dim,
                 iw_dim, ix_dim, ky_dim, v_dim, mode, need_grad_w,
+                need_grad_x,
+                need_grad_y,
                 use_multiwarp_candidates):
+
         result = _run_bwd(
             grad_out=grad_out, w=w, x=x, y=y,
             i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
@@ -2755,13 +3153,15 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             u_dim=int(u_dim), iw_dim=int(iw_dim), ix_dim=int(ix_dim),
             ky_dim=int(ky_dim), v_dim=int(v_dim), mode=mode,
             grad_w=bool(need_grad_w),
+            grad_x=bool(need_grad_x),
+            grad_y=bool(need_grad_y),
             use_multiwarp_candidates=bool(use_multiwarp_candidates),
         )
-        if bool(need_grad_w):
-            gw, gx, gy = result
-        else:
-            gx, gy = result
-            gw = w.new_empty((0,))
+
+        result_iter = iter(result)
+        gw = next(result_iter) if bool(need_grad_w) else w.new_empty((0,))
+        gx = next(result_iter) if bool(need_grad_x) else x.new_empty((0,))
+        gy = next(result_iter) if bool(need_grad_y) else y.new_empty((0,))
 
         ctx.save_for_backward(
             grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list
@@ -2776,13 +3176,21 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         ctx.v_dim = int(v_dim)
         ctx.mode = mode
         ctx.need_grad_w = bool(need_grad_w)
+        ctx.need_grad_x = bool(need_grad_x)
+        ctx.need_grad_y = bool(need_grad_y)
         ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
+        """ print(f"fasteq uniform1d_jit gw shape:{gw.shape}: {gw.sum()}")
+        if ctx.need_grad_x:
+            print(f"fasteq uniform1d_jit gx shape:{gx.shape}: {gx.sum()}")
+        if ctx.need_grad_y:
+            print(f"fasteq uniform1d_jit gy shape:{gy.shape}: {gy.sum()}") """
         return gw, gx, gy
 
     @staticmethod
     def backward(ctx, grad_grad_w, grad_grad_x, grad_grad_y):
         grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list = ctx.saved_tensors
-        d_go, d_w, d_x, d_y = _run_double_bwd(
+
+        result = _run_double_bwd(
             grad_out=grad_out,
             w=w, x=x, y=y,
             grad_grad_w=grad_grad_w if ctx.need_grad_w else None,
@@ -2800,12 +3208,20 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             v_dim=ctx.v_dim,
             mode=ctx.mode,
             grad_w=ctx.need_grad_w,
+            grad_x=ctx.need_grad_x,
+            grad_y=ctx.need_grad_y,
             use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
+
+        result_iter = iter(result)
+        d_go = next(result_iter)
+        d_w = next(result_iter) if ctx.need_grad_w else None
+        d_x = next(result_iter) if ctx.need_grad_x else None
+        d_y = next(result_iter) if ctx.need_grad_y else None
         return (
             d_go, d_w, d_x, d_y,
             None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
         )
 
 # -----------------------------------------------------------------------------
@@ -2825,6 +3241,15 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         use_multiwarp_candidates,
     ):
 
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0 """
+
+        # Capture the public input's autograd requirement before reshaping.
+        # This flag is part of both backward and double-backward JIT signatures.
+        need_grad_w = bool(ctx.needs_input_grad[0])
+        need_grad_x = bool(ctx.needs_input_grad[1])
+        need_grad_y = bool(ctx.needs_input_grad[2])
+
         i_list = _as_int32_meta_tensor(meta["i_list"])
         j_list = _as_int32_meta_tensor(meta["j_list"])
         k_list = _as_int32_meta_tensor(meta["k_list"])
@@ -2836,29 +3261,16 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         x_seg_num = meta["x_seg_num"]
         y_seg_num = meta["y_seg_num"]
         u_dim = meta["u_dim"]
-        # The public fast_uniform1d_jit() argument is the source of truth.
-        # Previously this value was read only from meta, while the wrapper did
-        # not pass its use_multiwarp_candidates argument into autograd.apply().
-        # Consequently False was ignored and None fell back to the global
-        # multi-warp default.
+
         use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
             use_multiwarp_candidates
         )
 
-        """ _print_index_reuse_stats(
-            i_list=i_list,
-            j_list=j_list,
-            k_list=k_list,
-            v_list=v_list,
-            print_details=True,
-        ) """
-        
         w_irreps =  int(meta["size_list"][0] / w_seg_num)
         x_irreps =  int(meta["size_list"][1] / x_seg_num)
         y_irreps =  int(meta["size_list"][2] / y_seg_num)
         out_irreps = int(meta["size_list"][3] / out_seg_num)
 
-        
 
         # Keep the public inputs, rather than views created inside forward(), in
         # the autograd context.  PyTorch executes a custom Function.forward()
@@ -2879,10 +3291,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             mode = "u,u,u,u"
 
         P = i_list.numel()
-        #print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
 
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000.0
 
         out = _run_fwd(
             w=w,
@@ -2903,9 +3312,11 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         out = out.view(-1, out_seg_num * u_dim)
 
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000.0
-        #print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+        """  torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000.0
+        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>") """
+
+        #print(f"uniform1d fwd x:{x.shape}, y:{y.shape}, w:{w.shape}")
 
         ctx.save_for_backward(w_input, x_input, y_input)
         ctx.i_list = i_list
@@ -2926,6 +3337,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         ctx.use_multiwarp_candidates = use_multiwarp_candidates
         ctx.input_indices=input_indices
         ctx.output_indices=output_indices
+        ctx.need_grad_w = need_grad_w
+        ctx.need_grad_x = need_grad_x
+        ctx.need_grad_y = need_grad_y
 
         return out
 
@@ -2946,11 +3360,12 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             ctx.input_indices, ctx.output_indices,
             ctx.out_seg_num, ctx.u_dim,
             ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num,
-            ctx.mode, bool(w_input.requires_grad), bool(ctx.use_multiwarp_candidates),
+            ctx.mode, ctx.need_grad_w, ctx.need_grad_x, ctx.need_grad_y,
+            bool(ctx.use_multiwarp_candidates),
         )
-        grad_w = gw3.view_as(w_input) if w_input.requires_grad else None
-        grad_x = gx3.view_as(x_input)
-        grad_y = gy3.view_as(y_input)
+        grad_w = gw3.view_as(w_input) if ctx.need_grad_w else None
+        grad_x = gx3.view_as(x_input) if ctx.need_grad_x else None
+        grad_y = gy3.view_as(y_input) if ctx.need_grad_y else None
         return grad_w, grad_x, grad_y, None, None, None, None
 
 def fast_uniform1d_jit(
@@ -2960,9 +3375,12 @@ def fast_uniform1d_jit(
     input_indices,
     output_indices,
     meta,
-    use_multiwarp_candidates: Optional[bool] = False,
+    use_multiwarp_candidates: Optional[bool] = None,
 ):
-    """Run Uniform1D JIT with optional multi-warp candidate generation.
+    """Run Uniform1D JIT using ENABLE_JIT_CANDIDATES from this file.
+
+    use_multiwarp_candidates overrides the environment's candidate policy when
+    supplied. ENABLE_JIT_CANDIDATES can disable candidate search globally.
     """
     return FastUniform1dJITFunction.apply(
         w,

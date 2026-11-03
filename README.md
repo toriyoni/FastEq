@@ -1,94 +1,94 @@
 # FastEq
 
-FastEq is a high-performance library for accelerating sparse tensor-product
-operators in SO(3)-equivariant neural networks. It provides optimized
-implementations of the core operators used by modern equivariant models while
-preserving compatibility with the `cuequivariance_torch` API.
+**High-performance GPU operators for equivariant neural networks.**
 
-FastEq currently supports:
+FastEq accelerates the geometric and equivariant computations at the core of atomistic machine learning. It brings together optimized tensor products, spherical harmonics, rotations, linear maps, and fused neural network operations for energy prediction, force evaluation, and model training.
 
-- **ChannelWiseTensorProduct (CWTP)**
-- **MessagePassingTensorProduct (MPTP)**, implemented as CWTP fused with
-  `scatter_sum`
-- **SymmetricContraction (STC)**
-- **EquivariantLinear(equi-linear)** 
+The project combines structure-aware kernel generation with Triton-based operator fusion. Its integration effort targets PyTorch workflows and interfaces used by e3nn and cuEquivariance, with cross-platform development.
 
-FastEq uses hardware-aware JIT compilation, static path specialization,
-path scheduling, data placement, and candidate benchmarking to generate
-efficient GPU implementations.
 
-## Reproducibility
+## Highlights
 
-This repository contains the source code required to build FastEq, integrate it
-with supported equivariant models, and reproduce the computational experiments
-reported in the paper.
+- **Structure-aware tensor products.** Exploit Clebsch–Gordan selection rules, specialize nonzero computation paths, and reuse intermediate values across paths.
+- **Fused GPU execution.** Combine compatible operations to reduce kernel launches and intermediate memory traffic, including activation and gating, graph softmax, and rotation-related data movement.
+- **Second-order derivative operators for training.** Support forward, backward, and double-backward computation for selected operators, enabling model training with force-based losses.
+- **Model integration.** Adapt core operators to the layouts and conventions used in equivariant message-passing networks and transformers.
+- **Hardware-aware optimization.** Tune tiling, scheduling, accumulation, and register/shared-memory placement for each workload and backend.
 
-The experiments do not introduce a new dataset. They use existing model
-packages, molecular structures, and benchmark configurations described in the
-paper and experiment scripts.
+## Operator Catalog
 
-### Reproducibility checklist coverage
+Model associations below follow the project operator inventory. Exact usage depends on the model variant and implementation. Operator names are descriptive catalog names and do not imply a stable Python import path.
 
-The repository provides:
+| Category | Operator | Function | Relevant model families | Feature |
+| --- | --- | --- | --- | --- |
+| Geometric encoding | `SphericalHarmonics` | Encode directions as spherical harmonic features. | Allegro, EquFlash, EquFlashV2, MACE, NequIP, SevenNet, TACE/TECE | Fused SphericalHarmonics |
+| Rotations and representation transforms | `FusedSO3Rotation` | Apply SO(3) rotations using Wigner-D matrices, with fusion of compatible surrounding operations. | EquiformerV3, EquiformerV2 | Fused pattern: Gather + Merge + SO3_Rotate |
+| Rotations and representation transforms | `FusedSO3Grid` | Transform between spherical harmonic coefficients and spherical grid signals. | EquiformerV3, EquiformerV2, eSEN | Fused pattern:  so3_grid.to_grid + activation + so3_grid.from_grid |
+| Tensor products and higher-order coupling | `ChannelwiseTensorProduct` | Couple equivariant representations through channelwise Clebsch–Gordan tensor products. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE | Register optimization and path scheduling by JIT |
+| Tensor products and higher-order coupling | `FullyConnectedTensorProduct` | Mix channels across allowed irreducible-representation coupling paths. | MACE, NequIP, SevenNet | Fused Gather + BatchGEMM + CG sparse  |
+| Tensor products and higher-order coupling | `SymmetricContraction` | Construct higher-order equivariant features through symmetric contractions. | MACE, TACE, TECE | Similar to ChannelwiseTensorProduct |
+| Equivariant linear maps | `SO3Linear` | Apply channel mixing between matching irreducible representations. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE, EquiformerV3, EquiformerV2, eSEN | Highly optimized fused TF32 GEMM and Triton FP32/FP64 fused GEMM |
+| Equivariant linear maps | `SO2Linear` | Apply SO(2)-equivariant channel mixing in local coordinate frames. | EquiformerV3, TACE/TECE | Triton FP32/FP64 fused GEMM  |
+| Graph Softmax | [`FusedGraphSoftmax`](doc/graph_softmax.md), [`FusedGraphSoftmaxIndex`](doc/graph_softmax_index.md) | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets | CSR and raw-index fusion; Triton first-order backward |
+| Graph attention | [`FusedAttenAlpha`](doc/attention_alpha.md) | Fuse normalization, activation, dropout, and weighted reduction in graph attention; Triton first-order backward | EquiformerV3; TACE/TECE attention integration targets | Fused Norm + Act + Dropout + Reduce |
+| Equivariant Gate| [`FusedEquivariantGate`](doc/equivariant_gate.md) | Fuse scalar activations with broadcast gating of higher-order features. | EquFlash, SevenNet, NequIP; EquiformerV3 gate variants | Fused e3nn.nn.Gate |
+| Equivariant normalization | [`FusedEquivariantLayerNorm`](doc/layernorm.md) | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3, EquiformerV2 | Fused statistics and affine transformation; first-order backward |
+| Equivariant dropout | [`FusedEquivariantDropout`](doc/equivariant_dropout.md) | Apply dropout with masks shared across components as required to preserve equivariance. | EquiformerV3 | Fused Dropout |
 
-- source code for the proposed operators and optimization methods;
-- comments and implementation structure corresponding to the paper design;
-- hardware and software requirements;
-- installation instructions;
-- example operator usage;
-- benchmark entry points and experiment configurations;
-- deterministic benchmark settings where randomness is not involved;
-- repeated timing measurements for latency evaluation.
+Graph softmax operates on attention weights; it supports equivariant attention but does not itself perform a representation rotation or tensor-product coupling.
 
-Exact benchmark commands, model checkpoints, structures, run counts, and
-reported configurations should be kept synchronized with the final paper and
-the scripts under the benchmark directories.
+GraphSoftmax keeps two explicit interfaces: the [CSR route](doc/graph_softmax.md)
+can reuse topology and contiguous node order, while the
+[raw-index route](doc/graph_softmax_index.md) avoids CSR construction and feature
+sorting when topology changes. Both are validated on H100 and Hygon; choose
+using the measured full-call cost for the intended graph distribution.
 
-## Requirements
+### Equivariant LayerNorm
 
-### Hardware
+CUDA/HIP FP32 normalization with first-order gradients for EquiformerV3 and
+EquiformerV2 layers. See [Equivariant LayerNorm](doc/layernorm.md) for supported
+layers, fused operations, usage, and validation coverage.
 
-The NVIDIA implementation requires a CUDA-capable GPU. The main NVIDIA
-experiments in the paper use an NVIDIA H100 GPU.
+See the [EQv3 validation index](doc/eqv3_validation.md) for current-source
+accuracy, performance, tested hardware, and remaining limits across five
+operator families.
 
-The paper also reports results on a HYGON DCU BW1000 where supported by the
-corresponding software stack.
+## How FastEq Optimizes Equivariant Computation
 
-| Device | FP32 peak | FP64 peak | Memory |
-|---|---:|---:|---:|
-| NVIDIA H100 | 66.9 TFLOPS | 33.5 TFLOPS | 80 GB HBM |
-| HYGON DCU BW1000 | 60 TFLOPS | 30 TFLOPS | 64 GB HBM |
+### Sparse path specialization
 
-### Software
+Clebsch–Gordan tensor products contain structured zeros imposed by selection rules. FastEq's tensor-product development builds on the FastTP approach: represent nonzero paths explicitly, specialize indices and coefficients at compilation time, and expose reuse across paths.
 
-Minimum requirements:
+Scheduling balances reuse against register pressure and occupancy. Depending on the workload, implementations can use register storage, shared-memory staging, or separate kernels to manage live intermediate values.
 
-- Python 3.10
-- CUDA Toolkit 12 or later
-- PyTorch 2.4.1 or later
-- cuEquivariance 0.8.0
+### Operator fusion
 
-Baseline versions used in the paper:
+Many equivariant layers combine small transformations with elementwise operations and irregular data movement. FastEq targets these sequences with fused implementations, including:
 
-| Software | Version |
-|---|---|
-| e3nn | 0.4.4 |
-| cuEquivariance | 0.10.0 |
-| OpenEquivariance | 0.5.4 |
-| FlashTP | commit `0fbbbbae1061afc9285092a939d3f9abd851a758` |
+- Scalar activation and higher-order feature gating.
+- Neighborhood softmax and compatible attention-weight transformations.
+- Node-feature gathering, source/target merging, radial weighting, and rotation where layouts permit.
+- Spherical-grid transforms and compatible nonlinear operations.
 
-Use the exact PyTorch and CUDA versions recorded by the experiment scripts or
-environment file when reproducing the final paper results.
+Fusion is selected by measurement: its benefit depends on tensor shape, memory layout, reuse, and the efficiency of the unfused baseline.
+
+### Second-order derivative operators for training
+
+FastEq supports the second-order derivatives required during training through specialized backward and double-backward implementations for selected operators. These implementations enable gradients to propagate through force predictions when optimizing energy-and-force losses. Gradient computation can be restricted to inputs that require it, avoiding unnecessary work and temporary storage.
+
+For atomistic models, energy inference, force inference, and force training have different differentiation requirements. Verify the complete operator path before using an inference-oriented implementation for training. Force evaluation requires coordinate gradients even when model parameters are not being optimized.
+
+## Backends
+
+FastEq combines Triton-based kernels with generated tensor-product implementations. Backend development includes CUDA/HIP paths and adaptation toward domestic AI accelerators through FlagOS. Support is operator-specific; cross-platform execution and performance must be validated on the target hardware.
 
 ## Installation
 
 ### 1. Clone the repository
 
 ```bash
-git clone -b v0.3.0 https://github.com/malixian/FastEq.git
+git clone https://github.com/malixian/FastEq.git
 git clone -b fasteq https://github.com/malixian/cuEquivariance_torch.git
-git clone -b fasteq https://github.com/malixian/mace.git
-git clone -b fasteq https://github.com/malixian/SevenNet.git
 ```
 
 
@@ -130,18 +130,7 @@ pip install . --no-build-isolation
 Do not run both editable and non-editable installation commands in the same
 environment unless intentionally reinstalling the package.
 
-### 4. Install the patched MACE package
-
-```bash
-cd 3rdparty/mace
-pip install -e . --no-build-isolation
-cd ../..
-```
-
-The patched package integrates FastEq operators into the MACE evaluation
-workflow.
-
-### 5. Install the patched cuEquivariance interface
+### 4. Install the patched cuEquivariance interface
 
 Install the required cuEquivariance packages:
 
@@ -160,183 +149,48 @@ pip install -e . --no-build-isolation
 cd ../../..
 ```
 
-## Using FastEq
-
-FastEq preserves the `cuequivariance_torch` interface. In supported operators,
-enable the optimized implementation with:
-
-```python
-use_fasteq=True
-```
-
-The following examples assume that `torch`, `cuequivariance` as `cue`, and
-`cuequivariance_torch` as `cuet` have been imported and that the irreducible
-representations and layout have been defined by the model.
-
-### Channel-wise tensor product
-
-```python
-import torch
-import cuequivariance as cue
-import cuequivariance_torch as cuet
-
-conv_tp = cuet.ChannelWiseTensorProduct(
-    cue.Irreps(cueq_config.group, irreps_in1),
-    cue.Irreps(cueq_config.group, irreps_in2),
-    cue.Irreps(cueq_config.group, irreps_out),
-    layout=cueq_config.layout,
-    shared_weights=shared_weights,
-    internal_weights=internal_weights,
-    dtype=torch.get_default_dtype(),
-    math_dtype=torch.get_default_dtype(),
-    use_fasteq=True,
-)
-
-mji = conv_tp(
-    node_feats[edge_index[0]],
-    edge_attrs,
-    tp_weights,
-)
-
-message = scatter_sum(
-    src=mji,
-    index=edge_index[1],
-    dim=0,
-    dim_size=node_feats.shape[0],
-)
-```
-
-### Message-passing tensor product
-
-The MPTP path fuses the tensor product with message aggregation. The following
-helper adapts the patched cuEquivariance operator to the MACE calling
-convention.
-
-```python
-import types
-import torch
-import cuequivariance as cue
-import cuequivariance_torch as cuet
+### 5. Testing
 
 
-def with_cueq_conv_fusion(conv_tp: torch.nn.Module) -> torch.nn.Module:
-    """Adapt a cuEquivariance convolution tensor product for fused execution."""
-    conv_tp.original_forward = conv_tp.forward
-
-    num_segments = conv_tp.m.buffer_num_segments[0]
-    num_operands = conv_tp.m.operand_extent
-    conv_tp.weight_numel = num_segments * num_operands
-
-    def forward(
-        self,
-        node_feats: torch.Tensor,
-        edge_attrs: torch.Tensor,
-        tp_weights: torch.Tensor,
-        edge_index: torch.Tensor,
-    ) -> torch.Tensor:
-        sender = edge_index[0]
-        receiver = edge_index[1]
-
-        return self.original_forward(
-            [tp_weights, node_feats, edge_attrs],
-            {1: sender},
-            {0: node_feats},
-            {0: receiver},
-        )[0]
-
-    conv_tp.forward = types.MethodType(forward, conv_tp)
-    return conv_tp
-
-
-mptp = cuet.ChannelWiseTensorProduct(
-    cue.Irreps(cueq_config.group, irreps_in1),
-    cue.Irreps(cueq_config.group, irreps_in2),
-    cue.Irreps(cueq_config.group, irreps_out),
-    layout=cueq_config.layout,
-    shared_weights=shared_weights,
-    internal_weights=internal_weights,
-    dtype=torch.get_default_dtype(),
-    math_dtype=torch.get_default_dtype(),
-    use_fasteq=True,
-)
-
-mptp = with_cueq_conv_fusion(mptp.ff)
-message = mptp(node_feats, edge_attrs, tp_weights, edge_index)
-```
-
-
-### Symmetric contraction
-
-```python
-import torch
-import cuequivariance as cue
-import cuequivariance_torch as cuet
-
-symmetric_contractions = cuet.SymmetricContraction(
-    cue.Irreps(cueq_config.group, irreps_in),
-    cue.Irreps(cueq_config.group, irreps_out),
-    layout_in=cue.ir_mul,
-    layout_out=cueq_config.layout,
-    contraction_degree=correlation,
-    num_elements=num_elements,
-    original_mace=(not use_reduced_cg),
-    dtype=torch.get_default_dtype(),
-    math_dtype=torch.get_default_dtype(),
-    use_fasteq=True,
-)
-
-node_feats = symmetric_contractions(
-    node_feats.flatten(1),
-    index_attrs,
-)
-```
-
-
-## Experimental methodology
-
-### Evaluation targets
-
-The paper evaluates FastEq at two levels:
-
-1. **Operator-level evaluation**
-   - CWTP
-   - MPTP
-   - FCTP
-   - STC
-   - Equivariant Linear
-
-2. **End-to-end evaluation**
-   - MACE-OFF
-   - SevenNet
-   - NequIP
-   - Allegro
-
-The selected workloads cover tensor products with different path counts,
-coupling structures, model sizes, and aggregation patterns.
-
-### Benchmarks
-
-The benchmark scripts are located in the `test` directory.
-The scripts report end-to-end inference latency for FastTP and the supported baseline implementations.
+Run the MACE batch benchmark with the `medium` model in FP32 precision.
 
 ```bash
 cd test
 ```
 
-Run the MACE-OFF benchmark:
+#### CUDA Code Generation Backend
 
 ```bash
-python3 mace_bench_new.py
+python3 mace_batch.py medium float32
 ```
 
-Run the SevenNet benchmark:
+#### Triton Code Generation Backend
 
 ```bash
-python3 sevennet_bench_v2.py
+FASTEQ_CODEGEN_BACKEND=triton python3 mace_batch.py medium float32
 ```
 
-Run the Nequip and Allegro benchmark:
 
-```bash
-cd nequip_allegro_test && bash run.sh
-```
+# FastEq Performance on a Hygon DCU
+
+## Significant Single-Accelerator Speedup with Performance Comparable to an A800 with CuEq
+
+In single-accelerator benchmarks using FP64 precision over 100 steps, FastEq achieved speedups of approximately **16.2×**, **16.5×**, and **13.4×** for aluminum, silicon, and magnesium oxide systems, respectively, compared with runs without FastEq.
+
+Compared with an NVIDIA A800 using CuEq, the domestic heterogeneous accelerator running FastEq delivered relative performance of approximately **1.47×**, **0.84×**, and **0.89×** for the three systems. These results demonstrate that FastEq provides substantial acceleration. Through joint optimization of domestic hardware and the operator library, the solution achieves application performance broadly comparable to the NVIDIA A800 and CuEq software ecosystem.
+
+![FastEq single-accelerator speedup and cross-platform performance comparison](pics/dcu/single_accelerator_performance.png)
+
+*Figure 1. FastEq single-accelerator speedup and performance comparison between the domestic heterogeneous accelerator and the A800-based solution.*
+
+## Compute and Interconnect Scaling for High-Accuracy Simulations with Over 100,000 Atoms
+
+Multi-accelerator tests demonstrate how the compute capability of each domestic heterogeneous accelerator and efficient inter-accelerator communication work together to support large-scale simulations. In the weak-scaling tests, increasing the accelerator count from 1 to 8 expanded the aluminum, silicon, and magnesium oxide systems to approximately **187,000**, **111,000**, and **97,000 atoms**, respectively. The corresponding eight-accelerator weak-scaling efficiencies were **88.4%**, **91.7%**, and **96.8%**.
+
+In the strong-scaling tests, increasing the accelerator count from 4 to 8 improved the simulation speed of the three fixed-size systems by approximately **1.55–1.61×**, corresponding to parallel efficiencies of approximately **77.4%–80.7%**. On eight accelerators, the aluminum system containing 108,000 atoms and the silicon system containing approximately 157,000 atoms achieved **0.194 ns/day** and **0.165 ns/day**, respectively.
+
+These results show that the compute and interconnect capabilities of the domestic heterogeneous accelerator platform can support high-accuracy molecular dynamics simulations involving more than 100,000 atoms on a single server, with simulation speeds on the order of **0.1–0.2 ns/day**.
+
+![Weak- and strong-scaling performance on domestic heterogeneous accelerators](pics/dcu/multi_accelerator_scaling.png)
+
+*Figure 2. Weak-scaling throughput and strong-scaling simulation speed on domestic heterogeneous accelerators.*
